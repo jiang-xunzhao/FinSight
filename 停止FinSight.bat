@@ -1,7 +1,10 @@
 @echo off
 setlocal
 title FinSight
-set "PY=C:\Users\35999\PyCharmMiscProject\.venv\Scripts\python.exe"
+rem 解释器优先级：项目内 .venv → 上级目录 .venv → 本机固定 venv → PATH 里的 python
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=%~dp0..\.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=C:\Users\35999\PyCharmMiscProject\.venv\Scripts\python.exe"
 if not exist "%PY%" (
   where python >nul 2>nul
   if errorlevel 1 (

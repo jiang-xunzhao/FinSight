@@ -39,10 +39,15 @@
 ## 安装
 
 ```powershell
-cd "C:\Users\35999\PycharmProjects\FinSight"
-python -m venv ..\.venv
-..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+git clone https://github.com/jiang-xunzhao/FinSight.git
+cd FinSight
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
 ```
+
+没有 git 的话，在仓库页面点 `Code → Download ZIP` 解压，再把下面命令里的 `.venv` 当作项目目录下的虚拟环境即可。
+复制出来的 `.env` 至少要填 `DEEPSEEK_API_KEY` 和 `MYSQL_PASSWORD` 两行，其余按注释说明取舍。
 
 数据库使用 `01_基础配置/config.py` 中的连接配置。正式部署时应把密码改为环境变量，并创建只读业务账号。
 可参考 `create_readonly_user.sql.example` 创建只读账号，再设置 `MYSQL_READONLY_USER` 和 `MYSQL_READONLY_PASSWORD`。
@@ -56,7 +61,7 @@ python -m venv ..\.venv
 ## 启动
 
 ```powershell
-..\.venv\Scripts\python.exe "99_启动入口\my_open.py"
+.venv\Scripts\python.exe "99_启动入口\my_open.py"
 ```
 
 浏览器打开：
@@ -88,13 +93,13 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 首次安装后检查索引状态：
 
 ```powershell
-..\.venv\Scripts\python.exe "06_维护工具\vector_index.py"
+.venv\Scripts\python.exe "06_维护工具\vector_index.py"
 ```
 
 重建全部向量：
 
 ```powershell
-..\.venv\Scripts\python.exe "06_维护工具\vector_index.py" --rebuild
+.venv\Scripts\python.exe "06_维护工具\vector_index.py" --rebuild
 ```
 
 新导入的文件会自动生成增量向量并写入 Qdrant。向量模型缓存在 `storage/models/`，Qdrant 本地数据保存在 `storage/qdrant/`。
@@ -102,13 +107,13 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 首次或重建后同步已有向量：
 
 ```powershell
-..\.venv\Scripts\python.exe "06_维护工具\vector_index.py" --sync-qdrant
+.venv\Scripts\python.exe "06_维护工具\vector_index.py" --sync-qdrant
 ```
 
 需要清空并重建 Qdrant 时：
 
 ```powershell
-..\.venv\Scripts\python.exe "06_维护工具\vector_index.py" --reset-qdrant
+.venv\Scripts\python.exe "06_维护工具\vector_index.py" --reset-qdrant
 ```
 
 默认使用嵌入式本地 Qdrant，不需要 Docker。设置 `QDRANT_URL` 后可切换到远程 Qdrant 服务。
@@ -131,9 +136,9 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 ## 验收
 
 ```powershell
-..\.venv\Scripts\python.exe "06_维护工具\vector_index.py"
-..\.venv\Scripts\python.exe "06_维护工具\acceptance_check.py"
-..\.venv\Scripts\python.exe "06_维护工具\correction_benchmark.py"
+.venv\Scripts\python.exe "06_维护工具\vector_index.py"
+.venv\Scripts\python.exe "06_维护工具\acceptance_check.py"
+.venv\Scripts\python.exe "06_维护工具\correction_benchmark.py"
 Invoke-RestMethod http://127.0.0.1:8501/api/summary
 Invoke-RestMethod http://127.0.0.1:8501/api/data-quality
 Invoke-RestMethod http://127.0.0.1:8501/api/vector-index
@@ -145,7 +150,7 @@ SQL 纠错评测会生成 `storage/correction_report.json`，其中包含纠错�
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "你的密钥"
-..\.venv\Scripts\python.exe "06_维护工具\correction_benchmark.py" --online
+.venv\Scripts\python.exe "06_维护工具\correction_benchmark.py" --online
 ```
 
 详细功能状态参见 `README` 的验收输出和运行日志。
