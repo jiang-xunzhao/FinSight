@@ -1096,6 +1096,7 @@ def rank_report_period(text: str) -> str:
 
     实测库内只有三种：2026年半年报 / 2025年年报 / 2024年年报（2_performance_report）。
     """
+    text = expand_relative_time_words(text)
     year = re.search(r"(20\d{2})", text)
     if not year:
         return ""
@@ -2137,7 +2138,7 @@ def repair_sql_using_llm(
 
 def canonical_report_period_from_question(question: str) -> str:
     """把问题中的常用报告期表达转换为数据库口径。"""
-    compact = re.sub(r"\s+", "", question or "")
+    compact = expand_relative_time_words(re.sub(r"\s+", "", question or ""))
     year_match = re.search(r"(20\d{2})年", compact)
     if not year_match:
         return ""
@@ -3347,7 +3348,7 @@ def answer_with_multi_company_data(
         gap = highest[1] - lowest[1]
         gap_text = (
             f"{gap:.2f}个百分点"
-            if label == "资产负债率" or "率" in label
+            if label == "资产负债率" or "率" in label or "同比" in label or "环比" in label
             else format_amount(gap, unit_mode)
         )
         key_points.append(
@@ -4629,7 +4630,14 @@ def resolve_followup_question(
     conversation_history: list[dict[str, str]] | None = None,
     session: dict[str, Any] | None = None,
 ) -> str:
-    """结合会话锁定和上一轮分析对象补全后续问题。"""
+    """结合会话锁定和上一轮分析对象补全后续问题。
+
+    轮廿二（用户 m02721）：「去年/今年/前年」先折算成具体年份（E1）；
+    省略式追问（「那去年呢」「那净利润呢」）除继承公司名外，再补上一轮的
+    期间与指标说法、带上锁定股票代码（E2），本地结构化链路才认得动；
+    「怎么样/如何」类概览意图只补公司名，保持概览行为。
+    """
+    question = expand_relative_time_words(question)
     active_context = (
         session.get("analysis_context")
         if isinstance(session, dict)
@@ -4662,11 +4670,51 @@ def resolve_followup_question(
         conversation_history = extract_session_history(
             find_chat_session(last_chat_session_id())
         )
+    previous_question = ""
     for item in reversed(conversation_history):
-        company_name = str(item.get("company_name") or "")
-        if company_name and company_name not in question:
-            return f"{company_name}{question}"
-    return question
+        previous_question = str(item.get("question") or "")
+        if previous_question:
+            break
+    locked = (
+        session.get("locked_company")
+        if isinstance(session, dict)
+        and isinstance(session.get("locked_company"), dict)
+        else {}
+    )
+    ticker = str(locked.get("ticker") or "").strip()
+    company_name = str(locked.get("name") or "").strip()
+    if not company_name:
+        for item in reversed(conversation_history):
+            company_name = str(item.get("company_name") or "")
+            if company_name:
+                break
+    result = question
+    if company_name and company_name not in result:
+        result = f"{company_name}{result}"
+    if (
+        previous_question
+        and len(re.sub(r"\s+", "", question)) <= 12
+        and not re.search(r"怎么样|如何|情况|表现|概览", result)
+        and not identify_comparison_companies(result)
+    ):
+        if not period_phrase_from_text(result) and period_phrase_from_text(previous_question):
+            result = f"{result}（{period_phrase_from_text(previous_question)}）"
+        if (
+            not metric_label_from_text(result)
+            and not re.search(r"率|额|比|金|值|利润|收入|支出|资产|负债|现金|存货|折旧", result)
+        ):
+            # 指标继承向历史深处回溯：连着几句短追问（「换成前年呢」「那去年呢」）
+            # 都不带指标，只看最近一句会把指标链打断（e2e B3/B4 实测）。
+            inherited_metric = ""
+            for item in reversed(conversation_history):
+                inherited_metric = metric_label_from_text(str(item.get("question") or ""))
+                if inherited_metric:
+                    break
+            if inherited_metric:
+                result = f"{result}{inherited_metric}"
+        if ticker and ticker not in result:
+            result = f"{ticker}{result}"
+    return result
 
 def last_chat_session_id() -> str | None:
     """在锁内取最近一个会话 id。

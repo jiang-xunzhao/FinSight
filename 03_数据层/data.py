@@ -3274,6 +3274,12 @@ METRIC_QUERY_MAP = {
     "净利润": ("2_performance_report", "net_profit", "净利润"),
     "归母净利润": ("2_performance_report", "net_profit_parent", "归母净利润"),
     "每股收益": ("2_performance_report", "eps", "每股收益"),
+    # 轮廿二：同比列一直在库里（revenue_yoy/profit_yoy），但没进指标映射，
+    # 本地结构化永远答不出「营收同比」——补上入口。净利润同比是**合并口径**
+    # 现算的，label 里带明（见 SCHEMA 规则 4，与公告归母同比不是一个数）。
+    "营业收入同比": ("2_performance_report", "revenue_yoy", "营收同比"),
+    "营收同比": ("2_performance_report", "revenue_yoy", "营收同比"),
+    "净利润同比": ("2_performance_report", "profit_yoy", "净利润同比（合并口径）"),
     "总资产": ("4_balance_sheet", "total_assets", "总资产"),
     "资产总额": ("4_balance_sheet", "total_assets", "总资产"),
     "总负债": ("4_balance_sheet", "total_liability", "总负债"),
@@ -4361,6 +4367,10 @@ def format_financial_metric(label: str, value: Any, unit_mode: str) -> str:
         return "暂无数据"
     if label in {"资产负债率"} or "率" in label:
         return f"{float(value):.2f}%"
+    # 轮廿二：同比也走这条格式化——库里存的数就是百分数（单位:%），
+    # 但 label 叫「营收同比」不带「率」字，曾被当成金额拼出「2.95 元」（服务器外验 V4 实测）。
+    if "同比" in label or "环比" in label:
+        return f"{float(value):.2f}%"
     return format_amount(value, unit_mode)
 
 def format_metric_change(series: list[dict[str, Any]], label: str, unit_mode: str) -> str:
@@ -4374,7 +4384,7 @@ def format_metric_change(series: list[dict[str, Any]], label: str, unit_mode: st
     delta = current - previous
     percentage = delta / abs(previous) * 100
     direction = "增长" if delta > 0 else "下降" if delta < 0 else "持平"
-    if label in {"资产负债率"} or "率" in label:
+    if label in {"资产负债率"} or "率" in label or "同比" in label or "环比" in label:
         return f"较上一期{direction} {abs(delta):.2f} 个百分点"
     return f"较上一期{direction} {abs(percentage):.2f}%"
 
@@ -4422,6 +4432,42 @@ PERIOD_SEMI_RE = re.compile(r"半年报|中期报告|中报")
 PERIOD_MULTI_RE = re.compile(r"(?:近|最近|过去|前)\s*([一二三四五六七八九十]|\d{1,2})\s*年|历年|各年|多年")
 CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
+# 轮廿二（用户 m02721）：相对时间说法以前整条链路都不认（只认 20\d{2}），
+# 「那去年呢」会被当成没点期间、错落最新一期。先折算成具体年份再走原有解析。
+RELATIVE_TIME_WORDS = {
+    "今年": 0, "本年": 0,
+    "去年": -1, "上年": -1, "上一年": -1, "上年度": -1,
+    "前年": -2,
+}
+
+def expand_relative_time_words(text: str) -> str:
+    """把「去年/今年/前年/上一年/上年度」折算成「2025年」这类具体年份。"""
+    out = str(text or "")
+    now_year = datetime.now().year
+    for word in sorted(RELATIVE_TIME_WORDS, key=len, reverse=True):
+        out = out.replace(word, f"{now_year + RELATIVE_TIME_WORDS[word]}年")
+    return out
+
+def period_phrase_from_text(text: str) -> str:
+    """抽出文本里点明的期间字面（「2025年年报」/「2024年」/「近三年」），没点明回空串。"""
+    body = re.sub(r"\s+", "", expand_relative_time_words(text))
+    year_match = re.search(r"(20\d{2})年?", body)
+    if year_match:
+        year = year_match.group(1)
+        if re.search(r"半年报|中期|中报", body):
+            return f"{year}年半年报"
+        if PERIOD_ANNUAL_RE.search(body):
+            return f"{year}年年报"
+        return f"{year}年"
+    multi = PERIOD_MULTI_RE.search(body)
+    if multi:
+        return multi.group(0)
+    return ""
+
+def metric_label_from_text(text: str) -> str:
+    """抽文本里第一个命中的指标标签，没有回空串（供追问继承拼句用）。"""
+    hit = extract_metric(str(text or ""))
+    return str(hit[2]) if hit else ""
 
 def report_period_hint(question: str) -> dict[str, Any]:
     """解析题目里的报告期意图：年份、年报/半年报、要不要多年跨度。
@@ -4430,7 +4476,7 @@ def report_period_hint(question: str) -> dict[str, Any]:
     只做 `latest = series[0]` ⇒ 「广州发展最近三年年报的营业收入」回 1 行 2026年半年报；
     「四川九洲2024年年报的净利润」也回 **2026年半年报**（答错期间还不说，比不支持跨度更严重）。
     """
-    text = str(question or "")
+    text = expand_relative_time_words(str(question or ""))
     years = [int(item) for item in re.findall(r"(20\d{2})", text)]
     kinds: set[str] = set()
     if PERIOD_ANNUAL_RE.search(text):
