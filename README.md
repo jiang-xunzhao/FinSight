@@ -47,6 +47,12 @@ python -m venv ..\.venv
 数据库使用 `01_基础配置/config.py` 中的连接配置。正式部署时应把密码改为环境变量，并创建只读业务账号。
 可参考 `create_readonly_user.sql.example` 创建只读账号，再设置 `MYSQL_READONLY_USER` 和 `MYSQL_READONLY_PASSWORD`。
 
+### 登录闸门（可选，建议对公网部署时开启）
+
+在 `.env` 里同时填 `LOGIN_USER` 与 `LOGIN_PASSWORD` 两行即可启用：全站需要登录，登录态是 30 天有效期的 HttpOnly cookie，
+改口令会让所有旧登录自动失效。任一行留空则全站开放（仅适合只监听 127.0.0.1 的本机调试）。
+测试环境想临时跳过登录，可设置环境变量 `FINSIGHT_DISABLE_LOGIN=1`。
+
 ## 启动
 
 ```powershell
