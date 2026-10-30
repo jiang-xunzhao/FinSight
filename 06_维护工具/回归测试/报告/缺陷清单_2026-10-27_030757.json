@@ -1,0 +1,14 @@
+[
+ {
+  "layer": "L3 异常",
+  "severity": "P3",
+  "doc": "(全库)",
+  "code": "-",
+  "period": "-",
+  "field": "向量点数",
+  "expected": "24490",
+  "actual": "读不到：Storage folder C:\Users\35999\PycharmProjects\FinSight\\storage\\qdrant is already accessed by another instance of Qdrant client. If you require concurrent access, use Qdrant server instead.",
+  "repro": "停服后跑本层，或看 GET /api/vector-index",
+  "log": "占用导致的不可读不算缺陷，但必须记账"
+ }
+]

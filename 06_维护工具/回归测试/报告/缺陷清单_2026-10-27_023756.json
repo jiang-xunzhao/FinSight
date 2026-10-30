@@ -1,0 +1,26 @@
+[
+ {
+  "layer": "L1 核心报表勾稽",
+  "severity": "P0",
+  "doc": "三一重工股份有限公司_2026年半年报.pdf; 三一重工股份有限公司_2026年半年报_摘要.pdf",
+  "code": "600031",
+  "period": "2026年半年报",
+  "field": "4_balance_sheet.total_equity",
+  "expected": "92084227000",
+  "actual": "93195609000.0000",
+  "repro": "SELECT total_equity FROM `4_balance_sheet` WHERE stock_code='600031'",
+  "log": "与已核验原文值不符（见 samples.ORACLE 的 note）"
+ },
+ {
+  "layer": "L3 异常",
+  "severity": "P2",
+  "doc": "中国国贸",
+  "code": "600007",
+  "period": "-",
+  "field": "HISTORIC_BUG_DOCS.file_needle",
+  "expected": "库里至少有一份文件名含该串",
+  "actual": "无匹配文档",
+  "repro": "SELECT DISTINCT file_name FROM `7_document_index`",
+  "log": "用例指向的文档已不在库里 ⇒ 这条历史 bug 不再被守护：①合并利润表那行 OCR 吃掉顿号 ⇒ 行首粘成「四净利润」，位置护栏认不出行首序号 ⇒ 真行被跳过；②「所有者权益变动表」里也有一行「净利润」（只有 136,256 / 185,213 千元口径的变动额），旧代码把标题当普通行首匹配、没有按报表块判 ⇒ 串号入库 ⇒ profit_yoy 算出 187200.4271%，而摘要写 0.17%"
+ }
+]

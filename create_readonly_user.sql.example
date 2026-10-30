@@ -1,0 +1,5 @@
+CREATE USER IF NOT EXISTS 'finsight_reader'@'127.0.0.1'
+IDENTIFIED BY 'replace-with-reader-password';
+
+GRANT SELECT ON finance_report.* TO 'finsight_reader'@'127.0.0.1';
+FLUSH PRIVILEGES;

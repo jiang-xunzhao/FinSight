@@ -1,0 +1,38 @@
+[
+ {
+  "layer": "L1 核心报表勾稽",
+  "severity": "P1",
+  "doc": "北京同仁堂股份有限公司_2026年半年报.pdf; 北京同仁堂股份有限公司_2026年半年报_摘要.pdf",
+  "code": "600085",
+  "period": "2026年半年报",
+  "field": "total_assets = total_liability + total_equity",
+  "expected": "差额/资产 ≤ 1%",
+  "actual": "资产 29946012856.7200 vs 负债+权益 22410935541.7700",
+  "repro": "SELECT * FROM `4_balance_sheet` WHERE stock_code='600085'",
+  "log": "恒等式不平（多为单位错位或取了母公司权益）"
+ },
+ {
+  "layer": "L2 格式",
+  "severity": "P2",
+  "doc": "中国国际贸易中心股份有限公司_2026年半年报.pdf; 中国国际贸易中心股份有限公司_2026年半年报_摘要.pdf",
+  "code": "600007",
+  "period": "2026年半年报",
+  "field": "revenue_yoy/profit_yoy",
+  "expected": "|值| ≤ 10000（bounded_percent 已限）",
+  "actual": "-3.8991 / 187200.4271",
+  "repro": "SELECT * FROM `2_performance_report` WHERE ABS(revenue_yoy)>10000",
+  "log": "百分比列越界"
+ },
+ {
+  "layer": "L4 边界",
+  "severity": "P2",
+  "doc": "三一重工股份有限公司_2026年半年报_摘要.pdf; 三一重工股份有限公司_2026年半年报.pdf",
+  "code": "600031",
+  "period": "2026年半年报",
+  "field": "经营+投资+筹资 vs 现金净增加额",
+  "expected": "差额通常来自汇率变动",
+  "actual": "和 -6374510000.0000 vs 净增加 -7143113000.0000（差 10.8%）",
+  "repro": "SELECT * FROM `5_cash_flow_statement` WHERE stock_code='600031'",
+  "log": "差额过大 ⇒ 可能取错列/错行"
+ }
+]
