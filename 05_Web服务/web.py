@@ -31,6 +31,7 @@ from pathlib import Path  # 使用跨平台路径对象定位项目文件
 from typing import Any  # 提供类型注解，提高代码可读性
 from urllib.parse import parse_qs, quote, urlparse  # 解析 URL 和编码文件名
 import urllib.request  # 访问本地服务并发送 HTTP 请求
+import base64  # 账户头像上传：Base64 解码
 
 # 第三方依赖：数据库和接口依赖。
 import pandas as pd  # 生成和展示财务数据表
@@ -65,20 +66,80 @@ SERVER_INSTANCE: ThreadingHTTPServer | None = None
 # 仅当 .env 同时设置 LOGIN_USER 与 LOGIN_PASSWORD 时启用；两者缺一 = 全站照旧开放
 # （回归测试与未配置环境零影响）。口令校验用 compare_digest，会话是 HMAC 签名的
 # 过期时间戳放进 HttpOnly cookie，改密码即让所有旧会话作废（密钥派生自口令）。
+# 轮卅起账号有了「在线自助」一层：storage/auth_users.json 存 SHA256(新密码) +
+# 昵称 + 头像标记。校验顺序 = 文件里改过的密码优先、.env 兜底（首次登录仍需 .env
+# 口令；改过之后 .env 旧口令即失效，.env 里删掉该账号 = 账号停用）。
+# ★ _session_secret 也读「有效口令」：用户在设置里改密码 ⇒ 密钥变 ⇒ 全站旧 cookie
+#   立即作废、重新登录。这是有意设计，别改回只读环境变量（那样改了密码旧会话照用 30 天）。
 SESSION_COOKIE = "fsession"
 SESSION_TTL_SECONDS = 30 * 24 * 3600
-LOGIN_PUBLIC_PATHS = {"/login", "/api/login", "/api/logout"}
+LOGIN_PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/api/me"}
+AUTH_USERS_PATH = BASE_DIR / "storage" / "auth_users.json"
+AVATAR_DIR = BASE_DIR / "storage" / "avatars"
+AUTH_STORE_LOCK = threading.Lock()
+PROFILE_UPLOAD_LIMIT = 2 * 1024 * 1024  # 头像上传上限 2MB（Base64 解码后的字节数）
+AVATAR_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
 
 def auth_enabled() -> bool:
-    # FINSIGHT_DISABLE_LOGIN=1：开发/截图用的临时总闸（只影响进程环境，
-    # 本机进程本来就能直调 data/web 函数，没引入新攻击面）。
-    if os.getenv("FINSIGHT_DISABLE_LOGIN") == "1":
+    """登录闸门总开关：.env 同时有 LOGIN_USER+LOGIN_PASSWORD 才启用；
+    FINSIGHT_DISABLE_LOGIN=1 是紧急总闸（测试/本机排障用），置 1 直接不启用。"""
+    if os.getenv("FINSIGHT_DISABLE_LOGIN", "") == "1":
         return False
-    return bool(os.getenv("LOGIN_USER")) and bool(os.getenv("LOGIN_PASSWORD"))
+    return bool(os.getenv("LOGIN_USER", "") and os.getenv("LOGIN_PASSWORD", ""))
+
+def read_auth_users() -> dict[str, Any]:
+    """账号自助层的读入口：文件缺失/损坏 = 空表，退化为纯 .env 单账号模式。"""
+    try:
+        if AUTH_USERS_PATH.exists():
+            data = json.loads(AUTH_USERS_PATH.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+def write_auth_users(store: dict[str, Any]) -> None:
+    AUTH_USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_USERS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(AUTH_USERS_PATH)
+
+def effective_password(user: str) -> str:
+    """登录校验用的口令：文件里有 sha256（网页改过密码）就与输入比对，否则用 .env。
+
+    返回值约定：**文件哈希在场时返回哈希本身**（调用方自己 digest 后比对），
+    其余情况返回明文——两种形态都由 handle_login / change_password 的 _verify_password 统一处理。
+    """
+    entry = read_auth_users().get(user) or {}
+    digest = str(entry.get("password_sha256") or "")
+    if digest:
+        return digest
+    if user == os.getenv("LOGIN_USER", ""):
+        return os.getenv("LOGIN_PASSWORD", "")
+    return ""
+
+def _verify_password(password: str, stored: str) -> bool:
+    """恒时比较口令：stored 是 64 位哈希则比对 SHA256(输入)，否则比明文（.env 兜底路径）。"""
+    if not stored:
+        return False
+    if len(stored) == 64 and all(ch in "0123456789abcdef" for ch in stored):
+        return hmac.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored)
+    # compare_digest 对含非 ASCII 的 str 直接抛 TypeError（=500）；统一转字节再比。
+    return hmac.compare_digest(password.encode("utf-8"), stored.encode("utf-8"))
 
 def _session_secret() -> bytes:
+    # 有效口令参与派生：网页改密 = 密钥变 = 旧 token 全废（见块头注释的坑说明）。
     seed = "|".join(
-        [os.getenv("LOGIN_USER", ""), os.getenv("LOGIN_PASSWORD", ""), "FinSight-session-salt-v1"]
+        [
+            os.getenv("LOGIN_USER", ""),
+            effective_password(os.getenv("LOGIN_USER", "")),
+            "FinSight-session-salt-v1",
+        ]
     )
     return hashlib.sha256(seed.encode("utf-8")).digest()
 
@@ -614,6 +675,11 @@ card.addEventListener("submit", async (event) => {
   document.body.classList.add("playing");
   setTimeout(() => { window.location.href = "/"; }, 950);
 });
+// 轮卅②互斥兜底：已经持有有效会话（比如另一窗口登录过、或本窗口刚改过密码）
+// 就不要停在这页——后端 /login 已做 302，这里管「页面早就开着」的情形。
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (me && me.logged === true && me.auth_enabled === true) window.location.replace("/");
+}).catch(() => {});
 </script>
 </body>
 </html>
@@ -730,7 +796,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def handle_login(self) -> None:
-        """POST /api/login：校验账号口令，成功发 30 天 HttpOnly cookie。"""
+        """POST /api/login：校验账号口令，成功发 30 天 HttpOnly cookie。
+
+        口令来源：storage/auth_users.json 里改过的密码优先，.env 兜底（见 effective_password）。
+        """
         length = int(self.headers.get("Content-Length", "0"))
         try:
             request = json.loads(self.rfile.read(length) or b"{}")
@@ -738,8 +807,9 @@ class Handler(BaseHTTPRequestHandler):
             request = {}
         user = str(request.get("username") or "")
         password = str(request.get("password") or "")
-        ok_user = hmac.compare_digest(user, os.getenv("LOGIN_USER", ""))
-        ok_pass = hmac.compare_digest(password, os.getenv("LOGIN_PASSWORD", ""))
+        env_user = os.getenv("LOGIN_USER", "")
+        ok_user = hmac.compare_digest(user, env_user)
+        ok_pass = _verify_password(password, effective_password(user))
         if not (auth_enabled() and ok_user and ok_pass):
             time.sleep(0.5)  # 拖慢口令爆破，不透露是账号还是口令错了
             self.send_json({"detail": "账号或密码不正确"}, HTTPStatus.UNAUTHORIZED)
@@ -762,7 +832,36 @@ class Handler(BaseHTTPRequestHandler):
         if self.require_login():
             return
         try:
-            if path == "/":
+            if path == "/api/me":
+                # 轮卅②互斥探测口：不带 cookie 也放行（LOGIN_PUBLIC_PATHS），回 logged 真假；
+                # 登录页据此跳主页、主页面据此跳登录。auth_enabled()==False（无 .env 账号）
+                # 时视为已登录的单机模式，昵称取 LOGIN_USER 或「本地用户」。
+                user = os.getenv("LOGIN_USER", "")
+                logged = (not auth_enabled()) or verify_session_token(self._cookie_value(SESSION_COOKIE))
+                entry = read_auth_users().get(user) or {}
+                self.send_json({
+                    "logged": logged,
+                    "auth_enabled": auth_enabled(),
+                    "username": user if logged else "",
+                    "display_name": str(entry.get("display_name") or user or "本地用户") if logged else "",
+                    "has_avatar": bool(entry.get("avatar")) and logged,
+                    "version": APP_VERSION,
+                })
+            elif path == "/api/avatar":
+                entry = read_auth_users().get(os.getenv("LOGIN_USER", "")) or {}
+                name = str(entry.get("avatar") or "")
+                file_path = AVATAR_DIR / name
+                if not name or (".." in name) or not file_path.is_file():
+                    raise KeyError("头像不存在")
+                body = file_path.read_bytes()
+                mime = next((m for magic, m in AVATAR_MAGIC if body.startswith(magic)), "image/png")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")  # 换头像要立刻见
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/":
                 body = INDEX_HTML.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -771,6 +870,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/login":
                 if not auth_enabled():
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                    return
+                # 轮卅②：登录页与主界面互斥。已持有有效会话 cookie 再访问 /login 直接
+                # 送回主页，杜绝「登录页开着、另一窗口主界面也开着、看起来像绕过登录」；
+                # 前端两侧还各有一道 /api/me 探测跳转兜底（改密即踢、老 cookie 失效场景）。
+                if verify_session_token(self._cookie_value(SESSION_COOKIE)):
                     self.send_response(HTTPStatus.FOUND)
                     self.send_header("Location", "/")
                     self.end_headers()
@@ -958,6 +1065,91 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length) or b"{}")
                 self.send_json(handle_chat_request(request))
+            elif path == "/api/profile":
+                # 轮卅④：账户信息——昵称（≤30 字）+ 头像（png/jpg/gif，≤2MB，Base64 内联上传）。
+                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    request = json.loads(self.rfile.read(length) or b"{}")
+                except (ValueError, UnicodeDecodeError):
+                    self.send_json({"detail": "请求格式不正确"}, 400)
+                    return
+                user = os.getenv("LOGIN_USER", "")
+                with AUTH_STORE_LOCK:
+                    store = read_auth_users()
+                    entry = store.setdefault(user, {})
+                    touched = False
+                    if "display_name" in request:
+                        name = str(request.get("display_name") or "").strip()[:30]
+                        entry["display_name"] = name
+                        touched = True
+                    if request.get("avatar"):
+                        raw = str(request["avatar"])
+                        _, _, b64 = raw.partition("base64,")  # 容忍 data:URL 前缀
+                        try:
+                            data = base64.b64decode(b64 or raw, validate=False)
+                        except Exception:
+                            self.send_json({"detail": "头像数据无法解码"}, 400)
+                            return
+                        mime = next((m for magic, m in AVATAR_MAGIC if data.startswith(magic)), "")
+                        if not mime:
+                            self.send_json({"detail": "头像仅支持 PNG/JPG/GIF"}, 400)
+                            return
+                        if len(data) > PROFILE_UPLOAD_LIMIT:
+                            self.send_json({"detail": "头像超过 2MB 上限"}, 400)
+                            return
+                        AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+                        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif"}[mime]
+                        fname = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', user)}{ext}"
+                        (AVATAR_DIR / fname).write_bytes(data)
+                        entry["avatar"] = fname
+                        touched = True
+                    if request.get("clear_avatar"):
+                        entry["avatar"] = ""
+                        touched = True
+                    if not touched:
+                        # 没带任何要改的字段 = 空操作：不落盘、不建账，免得把账号写出
+                        # 「空昵称」这种看着像被清过的状态（回归实测抓到的坑）。
+                        self.send_json({"ok": False, "detail": "未作修改"})
+                        return
+                    write_auth_users(store)
+                self.send_json({"ok": True, "display_name": entry.get("display_name", "")})
+            elif path == "/api/password":
+                # 轮卅④：改登录密码。验旧口令（文件哈希优先/.env 兜底）→ 存 SHA256(新)。
+                # 有效口令参与 _session_secret 派生 ⇒ 改密即废全站旧 cookie；
+                # 这里给本次会话重新发一张新 token，改的人不用被自己踢出去重登。
+                if not auth_enabled():
+                    self.send_json({"detail": "当前未启用登录，无需修改密码"}, 400)
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    request = json.loads(self.rfile.read(length) or b"{}")
+                except (ValueError, UnicodeDecodeError):
+                    request = {}
+                user = os.getenv("LOGIN_USER", "")
+                old = str(request.get("old_password") or "")
+                new = str(request.get("new_password") or "")
+                if len(new) < 6:
+                    self.send_json({"detail": "新密码至少 6 位"}, 400)
+                    return
+                if not _verify_password(old, effective_password(user)):
+                    time.sleep(0.5)
+                    self.send_json({"detail": "原密码不正确"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                with AUTH_STORE_LOCK:
+                    store = read_auth_users()
+                    store.setdefault(user, {})["password_sha256"] = hashlib.sha256(new.encode("utf-8")).hexdigest()
+                    write_auth_users(store)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header(
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE}={make_session_token()}; Path=/; HttpOnly; SameSite=Lax; "
+                    f"Max-Age={SESSION_TTL_SECONDS}",
+                )
+                body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/api/export/docx":
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1076,7 +1268,22 @@ INDEX_HTML = r"""
       --composer-space: 190px;
     }
     * { box-sizing: border-box; }
-    html { background: #03070f; }
+    /* 轮卅⑥：声明深色方案——Windows 上 native 控件（滚动条/文件框/日期框）
+       不再以浅色系统样式画出「白框」；autofill 白底另有 inset 规则兜底。 */
+    html { background: #03070f; color-scheme: dark; scrollbar-color: rgba(120,200,255,.30) rgba(6,14,26,.60); }
+    /* 轮卅⑤（m08259）：全页滚动条配主题——青蓝滑轨，不再 native 黑白 */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: rgba(6,14,26,.60); }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(120,200,255,.22); border-radius: 8px;
+      border: 2px solid transparent; background-clip: padding-box;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(120,200,255,.40); }
+    ::-webkit-scrollbar-corner { background: transparent; }
+    /* 轮卅⑥：点按钮后 Chrome/Edge 默认的浅色焦点环正是「侧边栏白框」——
+       统一去掉，改用品牌色细环（键盘导航仍可见）。 */
+    button:focus { outline: none; }
+    button:focus-visible { outline: 1px solid rgba(53,214,245,.55); outline-offset: 1px; }
     body {
       margin: 0;
       min-height: 100vh;
@@ -1154,7 +1361,10 @@ INDEX_HTML = r"""
       padding: 18px 14px;
       position: fixed;
       inset: 0 auto 0 0;
-      overflow-y: auto;
+      /* 轮卅⑤：侧栏改为定高列布局——历史区自己滚（.history-box），
+         品牌/导航/账户条钉住，列表增长不再推着整栏上下移动。 */
+      display: flex; flex-direction: column;
+      overflow: hidden;
     }
     .brand { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
     .brand span { color: var(--accent); }
@@ -1166,13 +1376,15 @@ INDEX_HTML = r"""
     .caption { color: #9ba8b4; font-size: 12px; margin-bottom: 18px; }
     .nav { display: grid; gap: 6px; margin-bottom: 18px; }
     .nav-btn {
-      text-align: left; border: 1px solid transparent; border-radius: 6px;
+      text-align: left; border: 1px solid transparent; border-radius: 7px;
       background: transparent; color: #aeb9c2; padding: 8px 10px;
+      transition: background .25s var(--ease), color .25s var(--ease), border-color .25s var(--ease);
     }
-    .nav-btn:hover { color: #ffffff; background: rgba(255,255,255,.05); }
+    .nav-btn:hover { color: #eaf6ff; background: #0c1c2e; }
     .nav-btn.active {
-      color: #ffffff; background: rgba(255,255,255,.08);
-      border-color: rgba(255,255,255,.12);
+      color: #ffffff; background: #122c46;
+      border-color: rgba(125,190,235,.28);
+      box-shadow: inset 2px 0 0 var(--accent);
     }
     .page { display: none; }
     .page.active { display: block; }
@@ -1188,18 +1400,31 @@ INDEX_HTML = r"""
       color: var(--text);
     }
     .page-panel h2 { margin: 0 0 8px; font-size: 20px; letter-spacing: -.024em; color: var(--pure); }
-    .side-title { color: var(--muted); font-size: 12px; margin: 18px 0 8px; }
+    .side-title { color: var(--muted); font-size: 12px; margin: 18px 0 8px; flex: none; }
+    /* 轮卅⑤：历史会话独立成框——框内滚动、细滚动条，不再撑动整栏 */
+    .history-box {
+      flex: 1 1 auto; min-height: 0;
+      overflow-y: auto;
+      border: 1px solid rgba(120,200,255,.16); border-radius: 10px;
+      background: rgba(6,13,24,.35);
+      padding: 8px;
+      margin-bottom: 10px;
+      scrollbar-width: thin; scrollbar-color: rgba(120,200,255,.28) transparent;
+    }
+    .history-box::-webkit-scrollbar { width: 8px; }
+    .history-box::-webkit-scrollbar-thumb { background: rgba(120,200,255,.24); border-radius: 8px; }
+    .history-box::-webkit-scrollbar-track { background: transparent; }
     .history-actions {
       display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;
     }
     .history-actions .ghost { padding: 6px 8px; font-size: 11px; }
     .history-actions .ghost {
-      color: #ffffff; border-color: rgba(255,255,255,.24);
-      background: rgba(255,255,255,.035);
+      color: #e6f2f8; border-color: rgba(125,190,235,.30);
+      background: linear-gradient(180deg, #14283f, #0e1f33);
     }
     .history-actions .ghost:hover {
-      color: #ffffff; border-color: rgba(255,255,255,.44);
-      background: rgba(255,255,255,.08);
+      color: #ffffff; border-color: rgba(53,214,245,.55);
+      background: linear-gradient(180deg, #1a3450, #122940);
     }
     .history-item {
       padding: 9px 10px; border-radius: 8px; margin-bottom: 6px;
@@ -1276,8 +1501,9 @@ INDEX_HTML = r"""
       height: 56px; border-bottom: 1px solid var(--line);
       display: flex; align-items: center; justify-content: space-between;
       padding: 0 24px;
-      background: rgba(6,16,28,0.70);
-      border-bottom-color: rgba(255,255,255,.09);
+      /* 轮卅①：实色深底，不再透明 */
+      background: #030a13;
+      border-bottom-color: rgba(125,190,235,.18);
       position: sticky; top: 0; z-index: 2;
     }
     .topbar h1 { font-size: 18px; margin: 0; font-weight: 650; color: #f7fbfd; }
@@ -1789,7 +2015,8 @@ INDEX_HTML = r"""
     #page-chat.hero .composer #refreshSuggestions,
     #page-chat.hero .composer #refreshNote { display: none; }
     #page-chat.hero .composer-inner { display: flex; flex-direction: column; }
-    #page-chat.hero .suggest-head { order: 2; margin: 0; }
+    /* 轮卅①：受众胶囊排再往下挪一点（用户 m08008：「往下移一点点」） */
+    #page-chat.hero .suggest-head { order: 2; margin: 6px 0 0; }
     #page-chat.hero .audience-options { margin-left: 0; flex-wrap: wrap; }
     /* 聊天态：推荐行换成「接着问」（与会话上下文相关的追问） */
     .followup-label {
@@ -1805,49 +2032,146 @@ INDEX_HTML = r"""
       margin-right: 0;
     }
     .audience-options {
-      display: flex; gap: 6px; align-items: center;
-      margin-left: auto; margin-top: 0; margin-bottom: 0; overflow: visible;
+      display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+      margin-left: 0; margin-top: 0; margin-bottom: 0; overflow: visible;
     }
     .audience-chip {
-      border: 1px solid var(--line); border-radius: 999px;
-      background: transparent; color: var(--muted);
-      padding: 4px 9px; font-size: 11px; white-space: nowrap;
+      border: 1px solid rgba(125,190,235,.24); border-radius: 999px;
+      background: #0b1a2a; color: #b9cddd;
+      padding: 2px 9px; font-size: 11px; white-space: nowrap; /* 轮卅三③：chip 高度 ~19 */
       transition: transform .35s var(--ease), border-color .35s var(--ease),
                   background .35s var(--ease), color .35s var(--ease), box-shadow .35s var(--ease);
     }
-    /* 与卡片同一套悬浮手感：上浮 2px + 冷光 + 描边提亮 */
+    /* 轮卅④（m08259）：去毛玻璃——实底深藏蓝+冷蓝细边，hover 只提亮描边不叠白 */
     .audience-chip:hover {
-      transform: translateY(-2px); color: var(--pure);
-      border-color: rgba(120,200,255,.42); background: rgba(120,200,255,.10);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 10px 22px -18px rgba(0,0,0,.9),
-                  0 0 34px -16px rgba(63,210,190,.55);
+      transform: translateY(-1px); color: #eaf6ff;
+      border-color: rgba(125,200,235,.55); background: #102338;
+      box-shadow: 0 8px 18px -14px rgba(0,0,0,.95);
     }
     .audience-chip.active {
-      color: var(--accent); border-color: rgba(45,212,191,.45);
-      background: rgba(15,107,95,.08);
+      color: #d8fff7; border-color: rgba(75,227,203,.62);
+      background: #0f3a36;
     }
     .composer .audience-chip {
-      color: #c7d5df; border-color: rgba(255,255,255,.18);
+      color: #cfe2f0; border-color: rgba(125,190,235,.26); background: #0c1c2d;
     }
     .composer .audience-chip.active {
-      color: #ffffff; border-color: rgba(94,234,212,.58);
-      background: rgba(45,212,191,.14);
+      color: #eafffb; border-color: rgba(94,234,212,.66); background: #12463f;
     }
-    .suggest-head {
-      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    /* 轮卅③：深度思考开关——琥珀色区别于青色受众位，点亮时描边发光 */
+    .think-chip {
+      border-style: dashed;
     }
+    .think-chip.active {
+      color: #ffe6b0; border-color: rgba(255,212,121,.68); border-style: solid;
+      background: rgba(255,212,121,.10);
+      box-shadow: 0 0 26px -10px rgba(255,212,121,.55);
+    }
+    /* 轮卅④：侧栏底部账户条 + 豆包式向上弹层 */
+    .side-account {
+      position: relative; flex: none;
+      margin: 14px -14px -18px; padding: 10px 14px 12px;
+      background: linear-gradient(180deg, rgba(6,13,24,0), rgba(6,13,24,.92) 30%, rgba(6,13,24,.97));
+      border-top: 1px solid rgba(255,255,255,.06);
+    }
+    .account-card {
+      display: flex; align-items: center; gap: 9px;
+      padding: 7px 9px; border-radius: 12px; cursor: pointer;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.045);
+      transition: border-color .35s var(--ease), background .35s var(--ease);
+    }
+    .account-card:hover { border-color: rgba(120,200,255,.34); background: rgba(120,200,255,.07); }
+    .account-avatar {
+      width: 28px; height: 28px; border-radius: 50%; flex: none;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700; color: #eaf3fb;
+      background: radial-gradient(120% 120% at 30% 25%, #3a7ba6, #0e5781 60%, #062c46);
+      border: 1px solid rgba(150,220,255,.35);
+      background-size: cover; background-position: center; overflow: hidden;
+    }
+    .account-avatar.has-img { color: transparent; }
+    .account-name {
+      flex: 1; min-width: 0; font-size: 12.5px; color: #dbe7f2;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .account-gear {
+      flex: none; width: 26px; height: 26px; border-radius: 8px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid transparent; background: transparent; color: var(--muted);
+      transition: color .3s var(--ease), border-color .3s var(--ease), transform .5s var(--ease);
+    }
+    .account-gear:hover { color: var(--ice); border-color: rgba(53,214,245,.35); transform: rotate(40deg); }
+    /* 轮卅③：账户设置页化（同文件库/数据校验）——弹层与居中模态整删，
+       内容改为 #page-account 页面里的三张卡；输入框全部深色底（④：不再有白框）。 */
+    .account-cards { display: grid; gap: 14px; max-width: 560px; margin-top: 14px; }
+    .account-card-block {
+      background: rgba(255,255,255,.03); border: 1px solid rgba(120,200,255,.14);
+      border-radius: 12px; padding: 14px 16px;
+    }
+    .account-card-block h3 { margin: 0 0 6px; font-size: 14px; color: var(--pure); }
+    .account-card-block .muted-note { font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+    .account-identity { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .account-identity strong { color: var(--pure); font-size: 14px; }
+    .account-identity .account-avatar { width: 40px; height: 40px; font-size: 17px; }
+    .account-row-label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+    #page-account input[type="text"], #page-account input[type="password"] {
+      width: 100%; padding: 8px 9px;
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--line); border-radius: 6px; outline: none;
+    }
+    #page-account input[type="text"]:focus, #page-account input[type="password"]:focus {
+      border-color: var(--accent);
+    }
+    #page-account input:-webkit-autofill {
+      -webkit-box-shadow: 0 0 0 1000px #101c2c inset;
+      -webkit-text-fill-color: var(--text);
+      transition: background-color 99999s 0s;
+    }
+    #page-account input[type="file"] { width: 100%; color: var(--muted); font-size: 12px; }
+    .account-act-btn {
+      margin: 12px 8px 0 0; padding: 7px 14px;
+      border: 1px solid rgba(94,234,212,.55); border-radius: 7px;
+      background: #0e2a30; color: #bfeee6; cursor: pointer;
+      transition: background .25s var(--ease), border-color .25s var(--ease);
+    }
+    .account-act-btn:hover { background: #12424a; border-color: rgba(94,234,212,.85); color: #eafffb; }
+    /* 轮卅③（m08259）：账户页三段改手风琴——点了才展开 */
+    .account-sec-head {
+      display: flex; align-items: center; justify-content: space-between; width: 100%;
+      padding: 9px 11px; margin-top: 8px;
+      border: 1px solid rgba(125,190,235,.22); border-radius: 9px;
+      background: #0d1e30; color: #dceaf5; font-size: 13px; text-align: left; cursor: pointer;
+      transition: border-color .25s var(--ease), background .25s var(--ease);
+    }
+    .account-sec-head:hover { border-color: rgba(53,214,245,.5); background: #10263c; }
+    .account-sec-head[aria-expanded="true"] { border-color: rgba(53,214,245,.6); background: #122c46; }
+    .account-sec-caret { color: var(--accent); font-size: 15px; transition: transform .25s var(--ease); }
+    .account-sec-head[aria-expanded="true"] .account-sec-caret { transform: rotate(90deg); }
+    .account-sec-body { padding: 4px 2px 8px; }
+    .account-note { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 16px; }
+    .account-note.err { color: var(--danger); }
+    .account-note.ok { color: var(--mint); }
+    /* 轮卅①：历史侧栏「生成中」伪行 + 忙碌会话行 */
+    .history-row.busy .history-open { color: var(--ice); }
+    .history-busy-dot {
+      width: 7px; height: 7px; border-radius: 50%; flex: none;
+      background: var(--accent); box-shadow: 0 0 10px rgba(53,214,245,.8);
+      animation: busy-pulse 1.1s ease-in-out infinite;
+    }
+    @keyframes busy-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
     .suggest-title {
       font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
       color: var(--muted);
     }
     .suggest-head .ghost {
       padding: 3px 10px; font-size: 11px; border-radius: 999px;
-      color: var(--ice); border-color: rgba(53,214,245,.22);
-      background: rgba(53,214,245,.06);
+      color: var(--ice); border-color: rgba(53,214,245,.30);
+      background: #0b2330;
       transition: border-color .5s var(--ease), background .5s var(--ease), color .5s var(--ease);
     }
     .suggest-head .ghost:hover {
-      color: var(--pure); border-color: rgba(53,214,245,.5); background: rgba(53,214,245,.12);
+      color: var(--pure); border-color: rgba(53,214,245,.6); background: #0f3143;
     }
     #refreshNote { font-size: 11px; }
     .suggestions {
@@ -1978,16 +2302,37 @@ INDEX_HTML = r"""
     }
     .clarification-options { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
     .clarify-chip {
-      border: 1px solid var(--line); background: transparent; color: var(--accent);
-      border-radius: 999px; padding: 4px 9px; font-size: 11px;
+      border: 1px solid rgba(94,234,212,.45); background: #0e2a30; color: #bfeee6;
+      border-radius: 999px; padding: 4px 10px; font-size: 11px;
     }
-    .input-row { display: flex; gap: 10px; }
+    .clarify-chip:hover { border-color: rgba(94,234,212,.8); background: #12424a; color: #eafffb; }
+    /* 轮卅③：聊天框容器化（DeepSeek 式）——输入区外框接管面板底+圆角+焦点高亮，
+       textarea 透明化，「深度思考」与「发送」住在框内下缘两端。 */
+    .input-box {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 3px 8px 2px 10px; /* 轮卅三③：框体压扁（textarea 18/line1.2、send 28、chip 19） */
+      transition: border-color .35s var(--ease);
+    }
+    .input-box:focus-within { border-color: var(--accent); }
+    .input-box textarea {
+      background: transparent; border: 0; border-radius: 0;
+      display: block; width: 100%; box-sizing: border-box;
+      padding: 1px 2px; min-height: 38px; line-height: 1.2; /* 轮卅五：默认两行高（18×2+衬2） */
+      text-align: left; /* 轮卅三②：empty-state 的 text-align:center 会居中 inline-block textarea 本体——display:block+全宽掰回 */
+    }
+    .box-tools { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+    .box-tools .send { margin-left: auto; }
+    .suggest-head {
+      display: flex; align-items: center; gap: 8px; margin: 8px 0;
+      /* 轮卅三①：受众排左缘=边框1+内衬10，与框内「深度思考」纵向对齐 */
+      padding-left: 11px;
+    }
     .composer-meta {
       display: flex; align-items: center; justify-content: space-between;
       gap: 12px; margin-top: 7px; color: #8f9fac; font-size: 11px;
     }
     .composer-meta span:last-child { white-space: nowrap; }
-    #page-chat:not(.hero) .composer textarea { min-height: 18px; padding: 4px 10px; }
+    #page-chat:not(.hero) .composer textarea { min-height: 38px; padding: 1px 4px; line-height: 1.2; } /* 轮卅五：同两行 */
     textarea {
       flex: 1; resize: none; min-height: 34px; max-height: 72px;
       background: var(--panel); color: var(--text);
@@ -1997,23 +2342,28 @@ INDEX_HTML = r"""
     }
     textarea:focus { border-color: var(--accent); }
     .send {
-      width: 76px; border: 1px solid rgba(120,200,255,.26); border-radius: 10px;
+      /* 轮卅②：图标钮——空闲=圆底上箭头，任务中/暂停=方底（形状锁定不再变） */
+      width: 28px; height: 28px; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid rgba(120,200,255,.26); border-radius: 50%;
       background: linear-gradient(180deg, rgba(23,45,71,0.94) 0%, rgba(11,23,39,0.90) 100%);
-      color: #cfeaf5; font-weight: 650; letter-spacing: .02em;
+      color: #cfeaf5;
       box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 6px 18px -14px rgba(0,0,0,.9);
-      transition: transform .35s var(--ease), box-shadow .35s var(--ease), border-color .35s var(--ease);
+      transition: transform .35s var(--ease), box-shadow .35s var(--ease), border-color .35s var(--ease), border-radius .25s var(--ease);
     }
     .send:hover {
       transform: translateY(-1px); filter: brightness(1.06);
       box-shadow: 0 10px 26px -10px rgba(53,214,245,.95), inset 0 1px 0 rgba(255,255,255,.45);
     }
+    .send[data-state="running"], .send[data-state="paused"] { border-radius: 9px; }
     .send[data-state="running"] { background: linear-gradient(135deg, #b9741d, #ffd479); color: #2a1a02; }
     .send[data-state="paused"] { background: linear-gradient(135deg, #245a8c, #4f9fd8); color: #04121c; }
     .ghost {
-      background: transparent; color: var(--text);
-      border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+      background: #0d1e30; color: #d5e4ee;
+      border: 1px solid rgba(140,200,240,.22); border-radius: 8px; padding: 7px 10px;
+      transition: border-color .25s var(--ease), color .25s var(--ease), background .25s var(--ease);
     }
-    .ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .ghost:hover { border-color: var(--accent); color: var(--accent); background: #10263c; }
     .settings { margin-top: 12px; }
     .settings input, .settings select {
       width: 100%; padding: 8px 9px; margin: 4px 0 10px;
@@ -2067,16 +2417,26 @@ INDEX_HTML = r"""
       <button class="nav-btn" data-page="validation">数据校验</button>
       <button class="nav-btn" data-page="coverage">数据体检</button>
       <button class="nav-btn" data-page="import">数据导入</button>
-      <button class="nav-btn" data-page="settings">设置</button>
     </nav>
 
     <div class="side-title">历史会话</div>
-    <div class="history-actions">
-      <button class="ghost" id="newSession">新建会话</button>
-      <button class="ghost" id="clearHistory">清空历史</button>
+    <div class="history-box">
+      <div class="history-actions">
+        <button class="ghost" id="newSession">新建会话</button>
+        <button class="ghost" id="clearHistory">清空历史</button>
+      </div>
+      <div id="historyList"></div>
     </div>
-    <div id="historyList"></div>
-    <button class="ghost" id="logoutBtn" style="margin-top:10px">退出登录</button>
+
+    <div class="side-account" id="sideAccount">
+      <div class="account-card" id="accountCard" title="账户设置">
+        <span class="account-avatar" id="accountAvatar">F</span>
+        <span class="account-name" id="accountName">本地用户</span>
+        <button class="account-gear" id="accountGear" aria-label="打开账户设置" title="账户设置">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+    </div>
   </aside>
 
   <aside class="sql-rail" id="sqlRail" aria-label="SQL 执行日志">
@@ -2146,10 +2506,17 @@ INDEX_HTML = r"""
       </div>
       <div class="composer">
         <div class="composer-inner">
+          <div class="input-box">
+            <textarea id="question" rows="1" placeholder="给FinSight发消息"></textarea>
+            <div class="box-tools">
+              <!-- 轮卅③：深度思考开关（用户 m07360：默认=简洁结论，点开=详细讲解）；
+                   轮卅①（m08008）挪到输入框内左下角——和 DeepSeek 一样，发送钮同区右下。 -->
+              <button class="audience-chip think-chip" id="deepThinkBtn" aria-pressed="false"
+                      title="默认只给简洁结论；打开后按「详细讲解」风格完整展开">深度思考</button>
+              <button class="send" id="sendBtn" title="发送（Enter）" aria-label="发送"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></button>
+            </div>
+          </div>
           <div class="suggest-head">
-            <span class="suggest-title">试试问</span>
-            <button class="ghost" id="refreshSuggestions">换一批</button>
-            <span class="muted" id="refreshNote"></span>
             <div class="audience-options" id="audienceOptions">
               <button class="audience-chip active" data-audience="综合分析师">综合分析师</button>
               <button class="audience-chip" data-audience="投行/卖方分析师">投行/卖方分析师</button>
@@ -2157,12 +2524,11 @@ INDEX_HTML = r"""
               <button class="audience-chip" data-audience="风险控制/审计">风险控制/审计</button>
               <button class="audience-chip" data-audience="个人投资者">个人投资者</button>
             </div>
+            <span class="suggest-title">试试问</span>
+            <button class="ghost" id="refreshSuggestions">换一批</button>
+            <span class="muted" id="refreshNote"></span>
           </div>
           <div class="suggestions" id="suggestions"></div>
-          <div class="input-row">
-            <textarea id="question" placeholder="给FinSight发消息"></textarea>
-            <button class="send" id="sendBtn">发送</button>
-          </div>
           <div class="composer-meta">
             <span>未填写 API 密钥时，系统支持核心财务数据的基础查询。</span>
             <span>Enter 发送 · Shift+Enter 换行</span>
@@ -2212,6 +2578,51 @@ INDEX_HTML = r"""
       </div>
     </section>
 
+    <section class="page" id="page-account">
+      <div class="page-panel">
+        <h2>账户设置</h2>
+        <div class="account-cards">
+          <div class="account-card-block">
+            <div class="account-identity">
+              <span class="account-avatar" id="accountPageAvatar">F</span>
+              <strong id="accountPageName">本地用户</strong>
+            </div>
+            <!-- 轮卅③（m08259）：三段点了才展开，默认全收起 -->
+            <button class="account-sec-head" id="secHeadProfile" aria-expanded="false" aria-controls="secBodyProfile">账户信息<span class="account-sec-caret" aria-hidden="true">›</span></button>
+            <div class="account-sec-body" id="secBodyProfile" hidden>
+              <label class="account-row-label" for="profileName">昵称（30 字内）</label>
+              <input id="profileName" type="text" maxlength="30" placeholder="">
+              <label class="account-row-label" for="profileAvatar">头像（png/jpg/gif，≤2MB）</label>
+              <input id="profileAvatar" type="file" accept="image/png,image/jpeg,image/gif">
+              <div>
+                <button class="account-act-btn" id="profileSave">保存</button>
+                <button class="account-act-btn" id="profileClearAvatar">移除头像</button>
+              </div>
+              <div class="account-note" id="profileNote"></div>
+            </div>
+            <button class="account-sec-head" id="secHeadPw" aria-expanded="false" aria-controls="secBodyPw">修改密码<span class="account-sec-caret" aria-hidden="true">›</span></button>
+            <div class="account-sec-body" id="secBodyPw" hidden>
+              <p class="muted-note">修改成功后本设备自动续用，其他设备的登录会失效。</p>
+              <label class="account-row-label" for="pwOld">旧密码</label>
+              <input id="pwOld" type="password" autocomplete="current-password">
+              <label class="account-row-label" for="pwNew">新密码（至少 6 位）</label>
+              <input id="pwNew" type="password" autocomplete="new-password">
+              <label class="account-row-label" for="pwNew2">确认新密码</label>
+              <input id="pwNew2" type="password" autocomplete="new-password">
+              <div><button class="account-act-btn" id="pwSave">修改密码</button></div>
+              <div class="account-note" id="pwNote">改完口令后，全站旧登录令牌自动失效。</div>
+            </div>
+            <button class="account-sec-head" id="secHeadAbout" aria-expanded="false" aria-controls="secBodyAbout">关于系统<span class="account-sec-caret" aria-hidden="true">›</span></button>
+            <div class="account-sec-body" id="secBodyAbout" hidden>
+              <p class="muted-note">FinSight 上市公司财报智能分析系统 · 版本 <span id="accountVersion">FinSight</span></p>
+              <p class="muted-note">回答风格与受众视角在服务端生效：提示词风格要求 + 句/字/条上限截断双重约束。</p>
+              <div><button class="account-act-btn" id="accountLogout" title="退出当前账号（本设备）">退出登录</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="page" id="page-validation">
       <div class="page-panel">
         <h2>数据校验报告</h2>
@@ -2228,29 +2639,6 @@ INDEX_HTML = r"""
           <span class="muted" id="coverageSummary">还没体检。</span>
         </div>
         <div id="coverageList"></div>
-      </div>
-    </section>
-
-    <section class="page" id="page-settings">
-      <div class="page-panel">
-        <h2>接口设置</h2>
-        <p class="muted">DeepSeek 密钥由服务器读取 DEEPSEEK_API_KEY，不在浏览器中保存或显示。</p>
-        <div class="settings">
-          <label>API 地址</label>
-          <input id="baseUrl" value="https://api.deepseek.com" readonly>
-          <label>对话模型</label>
-          <input id="llmModel" value="deepseek-flash" readonly>
-          <label>金额单位</label>
-          <select id="unitMode">
-            <option>自动</option><option>元</option><option>万元</option><option>亿元</option>
-          </select>
-          <label>回答风格</label>
-          <select id="answerStyle">
-            <option>分析师视角</option><option>简洁结论</option><option>详细讲解</option>
-          </select>
-          <button class="ghost" id="saveSettings">保存设置</button>
-          <div id="settingsState" class="muted"></div>
-        </div>
       </div>
     </section>
   </main>
@@ -2290,10 +2678,17 @@ let recommendations = [];
 let loadedHistoryId = null;
 let selectedAudience = "综合分析师";
 let currentSessionId = null;
-let currentTaskId = null;
 let chatStarting = false;
-let currentTaskState = null;
-let taskPollTimer = null;
+// 轮卅①：多任务表。以前一个窗口只认 currentTaskId 一个任务，切会话/新建就把它杀了
+// （=用户看到的「当前会话消失」）。现在每个在跑的任务在这张表里自立门户：
+// {thinking: 气泡节点(可跨视图搬家), viewSession, epoch: 发起时的视图代号, state, timer}。
+// 只有 epoch 对得上当前视图的任务才往屏幕上画；对不上的后台继续跑，完成后落历史。
+const trackedTasks = new Map();
+let viewEpoch = 0;
+// 轮卅③：深度思考开关（localStorage 记忆）。关=「简洁结论」，开=「详细讲解」——
+// 这两个风格在后端本来就生效（提示词指令 + 句/字/条上限硬截，见 assistant.py ANSWER_STYLE_RULES）。
+let deepThinkOn = false;
+try { deepThinkOn = localStorage.getItem("finsight_deep_think") === "1"; } catch (_) {}
 let sqlLogExpanded = false;
 // 复制按钮要能拿到最近一次的日志：renderSqlLogs 每次把裁剪后的条目留一份在这。
 let lastSqlLogs = [];
@@ -2310,54 +2705,14 @@ const pageTitles = {
   validation: "数据校验",
   coverage: "数据体检",
   import: "数据导入",
-  settings: "设置"
+  account: "账户设置"
 };
-const SETTINGS_KEY = "finsight_settings";
-
-function collectSettings() {
-  return {
-    baseUrl: "https://api.deepseek.com",
-    llmModel: "deepseek-flash",
-    analysisMode: document.getElementById("analysisMode").value,
-    unitMode: document.getElementById("unitMode").value,
-    answerStyle: document.getElementById("answerStyle").value
-  };
-}
-
-function applySettings(settings) {
-  if (!settings) return;
-  document.getElementById("baseUrl").value = "https://api.deepseek.com";
-  document.getElementById("llmModel").value = "deepseek-flash";
-  document.getElementById("analysisMode").value =
-    settings.analysisMode === "local" ? "local" : "deepseek";
-  document.getElementById("unitMode").value = settings.unitMode || "自动";
-  document.getElementById("answerStyle").value = settings.answerStyle || "分析师视角";
-}
-
+// 轮卅④：旧「设置」页整删（接口地址/模型是写死的、回答风格换成聊天框的「深度思考」
+// 开关、金额单位固定「自动」）。analysisMode（topbar 的模式下拉）保留、不再存 localStorage。
 function syncModeStatus() {
   const mode = document.getElementById("analysisMode").value;
   document.getElementById("status").textContent =
     mode === "deepseek" ? "智能分析就绪" : "本地数据就绪";
-}
-
-function saveSettings() {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(collectSettings()));
-    document.getElementById("settingsState").textContent = "设置已保存";
-  } catch (error) {
-    document.getElementById("settingsState").textContent = "保存失败";
-  }
-}
-
-function loadSavedSettings() {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return false;
-    applySettings(JSON.parse(raw));
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function switchPage(pageName) {
@@ -2378,14 +2733,35 @@ function switchPage(pageName) {
 document.querySelectorAll(".nav-btn").forEach(button => {
   button.onclick = () => switchPage(button.dataset.page);
 });
-document.querySelectorAll(".audience-chip").forEach(button => {
+document.querySelectorAll(".audience-chip:not(.think-chip)").forEach(button => {
   button.onclick = () => {
     selectedAudience = button.dataset.audience || "综合分析师";
-    document.querySelectorAll(".audience-chip").forEach(item => {
+    document.querySelectorAll(".audience-chip:not(.think-chip)").forEach(item => {
       item.classList.toggle("active", item === button);
     });
   };
 });
+
+// 轮卅③：深度思考开关（聊天框左下角，青色受众位右侧的琥珀 chip）。
+// 它只决定 answer_style 传「详细讲解」还是「简洁结论」——两档在后端都是真生效的
+// （提示词风格要求 + apply_answer_style 按句/字/条上限截断，assistant.py ANSWER_STYLE_RULES）。
+const deepThinkBtn = document.getElementById("deepThinkBtn");
+function paintDeepThink() {
+  if (!deepThinkBtn) return;
+  deepThinkBtn.classList.toggle("active", deepThinkOn);
+  deepThinkBtn.setAttribute("aria-pressed", deepThinkOn ? "true" : "false");
+  deepThinkBtn.title = deepThinkOn
+    ? "深度思考已开启：回答按「详细讲解」输出（更长、分点展开）"
+    : "深度思考已关闭：回答按「简洁结论」输出（结论+关键数值）";
+}
+if (deepThinkBtn) {
+  deepThinkBtn.onclick = () => {
+    deepThinkOn = !deepThinkOn;
+    try { localStorage.setItem("finsight_deep_think", deepThinkOn ? "1" : "0"); } catch (_) {}
+    paintDeepThink();
+  };
+  paintDeepThink();
+}
 
 async function loadRecommendations() {
   try {
@@ -2539,24 +2915,47 @@ async function loadHistory() {
   }
   items = Array.isArray(items) ? items : [];
   list.innerHTML = "";
-  if (!items.length) {
+  const busySessions = new Set();
+  trackedTasks.forEach(t => { if (t.viewSession) busySessions.add(t.viewSession); });
+  // 轮卅①：还在后台跑、还没落进历史的新会话任务，先挂一条「生成中」伪行，
+  // 点它可以回到那个任务的实时视图——不然用户切走以后就以为问题丢了。
+  trackedTasks.forEach((t, taskId) => {
+    if (t.viewSession) return;
+    const row = document.createElement("div");
+    row.className = "history-row busy";
+    const dot = document.createElement("span");
+    dot.className = "history-busy-dot";
+    const open = document.createElement("button");
+    open.className = "history-open";
+    open.textContent = `⏳ ${t.question.slice(0, 18)}（生成中…）`;
+    open.onclick = () => openTrackedTask(taskId);
+    row.appendChild(dot);
+    row.appendChild(open);
+    list.appendChild(row);
+  });
+  if (!items.length && !trackedTasks.size) {
     list.innerHTML = '<div class="muted">暂无历史会话</div>';
     return;
   }
   items.forEach(item => {
     const row = document.createElement("div");
     row.className = "history-row";
+    if (busySessions.has(item.id)) {
+      row.classList.add("busy");
+      const dot = document.createElement("span");
+      dot.className = "history-busy-dot";
+      row.appendChild(dot);
+    }
     const openButton = document.createElement("button");
     openButton.className = "history-open";
     openButton.textContent = item.title;
     openButton.onclick = async () => {
-      // 切进历史会话前先终止在跑的轮询链，否则旧任务完成时会把答案插进这份历史会话、还会改走 currentSessionId。
-      if (taskPollTimer) {
-        clearTimeout(taskPollTimer);
-        taskPollTimer = null;
-      }
-      currentTaskId = null;
-      currentTaskState = null;
+      // 轮卅①改版：切历史会话**不再杀别的任务的轮询链**——只推进 viewEpoch，
+      // 后台任务的轮询自己发现 epoch 对不上就不再往屏幕上画（任务继续跑、完成落历史）。
+      // 若正在看的这个会话有在跑的任务，把它的 thinking 气泡搬回本次渲染末尾（见 renderSession）。
+      const homeSession = item.id;
+      viewEpoch += 1;
+      const epoch = viewEpoch;
       chatStarting = false;
       let detail;
       try {
@@ -2566,12 +2965,14 @@ async function loadHistory() {
         updateTaskContext(error.message, 0);
         return;
       }
+      if (epoch !== viewEpoch) return;  // 期间又切走了，这次的渲染作废
       switchPage("chat");
       renderSession(detail);
       loadedHistoryId = item.id;
       currentSessionId = detail.id;
       updateSessionContext(detail.title, `${detail.messages?.length || 0} 条消息`);
-      updateTaskContext("已载入历史会话", 100);
+      const busy = reattachTrackedThinking(detail.id);
+      updateTaskContext(busy ? "该会话正在生成回答" : "已载入历史会话", busy ? 58 : 100);
     };
     const deleteButton = document.createElement("button");
     deleteButton.className = "history-delete";
@@ -2581,6 +2982,13 @@ async function loadHistory() {
     deleteButton.onclick = async () => {
       const deletingCurrent =
         currentSessionId === item.id || loadedHistoryId === item.id;
+      // 该会话还有在跑的任务：一并取消追踪（服务器算完落不了地——历史已删，属预期）。
+      trackedTasks.forEach((t, taskId) => {
+        if (t.viewSession !== item.id) return;
+        if (t.timer) { clearTimeout(t.timer); t.timer = null; }
+        t.thinking?.remove();
+        trackedTasks.delete(taskId);
+      });
       await fetch(`/api/history/${item.id}`, { method: "DELETE" });
       if (deletingCurrent) {
         resetChatSession();
@@ -2650,13 +3058,10 @@ function resetChatSession() {
   syncModeStatus();
   loadedHistoryId = null;
   currentSessionId = null;
-  currentTaskId = null;
-  currentTaskState = null;
+  // 轮卅①：新建会话**不再杀在跑的任务**——只推进 viewEpoch：
+  // 后台任务的轮询继续跑、完成后自己落历史；本视图不再是它们的画布。
+  viewEpoch += 1;
   chatStarting = false;
-  if (taskPollTimer) {
-    clearTimeout(taskPollTimer);
-    taskPollTimer = null;
-  }
   setComposerState("idle");
   renderSqlLogs([], "");
   setSqlLogExpanded(false);
@@ -2665,6 +3070,43 @@ function resetChatSession() {
   lastUserQuestion = "";
   setHeroMode(true);
   document.getElementById("question").focus();
+}
+
+// 轮卅①：把某会话在跑任务的「思考气泡」搬进当前视图（renderSession 清屏后调用）。
+// 搬回来≠重新订阅日志——轮询一直在跑，只是过去画不到这块屏上。
+function reattachTrackedThinking(sessionId) {
+  let hit = null;
+  trackedTasks.forEach(t => { if (!hit && t.viewSession === sessionId) hit = t; });
+  if (!hit) return false;
+  document.getElementById("messages").appendChild(hit.thinking);
+  hit.epoch = viewEpoch;
+  syncComposerSpace();
+  return true;
+}
+
+// 轮卅①：从侧栏「⏳生成中」伪行点回一个后台任务——手工重建它的视图
+//（这个会话后端还没落盘，不能走 /api/history）。
+function openTrackedTask(taskId) {
+  const entry = trackedTasks.get(taskId);
+  if (!entry) return;
+  switchPage("chat");
+  setHeroMode(false);  // 先让 composer 回坞，再清 #messages——hero 态下气泡住在 #messages 里
+  const messages = document.getElementById("messages");
+  messages.innerHTML = "";
+  viewEpoch += 1;
+  entry.epoch = viewEpoch;
+  currentSessionId = entry.viewSession || null;
+  loadedHistoryId = entry.viewSession || null;
+  chatStarting = false;
+  const userMessage = document.createElement("div");
+  userMessage.className = "message user";
+  userMessage.innerHTML = `<div class="bubble">${escapeHtml(entry.question)}</div>`;
+  messages.appendChild(userMessage);
+  messages.appendChild(entry.thinking);
+  setComposerState(entry.state?.paused ? "paused" : "running");
+  syncComposerSpace();
+  updateSessionContext(currentSessionId ? "当前会话" : "新会话", "分析进行中");
+  updateTaskContext(entry.state?.stage || "处理中", 58);
 }
 
 async function loadDocuments() {
@@ -4122,14 +4564,27 @@ function setComposerState(state) {
   const button = document.getElementById("sendBtn");
   document.getElementById("analysisMode").disabled = state !== "idle";
   button.dataset.state = state;
+  // 轮卅二②：空闲=圆底上箭头；任务进行/暂停=方底（形状不再变，只换色调与指示），
+  // 点击暂停/继续的语义仍由 sendQuestion 的可见任务分支处理。
+  const ICONS = {
+    send: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M9 5.5v13M15 5.5v13"/></svg>',
+    resume: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>'
+  };
   if (state === "running") {
-    button.textContent = "暂停";
+    button.innerHTML = ICONS.pause;
+    button.title = "正在生成，点击暂停";
+    button.setAttribute("aria-label", "暂停生成");
     button.disabled = false;
   } else if (state === "paused") {
-    button.textContent = "继续";
+    button.innerHTML = ICONS.resume;
+    button.title = "已暂停，点击继续";
+    button.setAttribute("aria-label", "继续生成");
     button.disabled = false;
   } else {
-    button.textContent = "发送";
+    button.innerHTML = ICONS.send;
+    button.title = "发送（Enter）";
+    button.setAttribute("aria-label", "发送");
     button.disabled = false;
   }
 }
@@ -4729,15 +5184,19 @@ try {
 
 async function sendQuestion() {
   const status = document.getElementById("status");
-  if (currentTaskId) {
-    const action = currentTaskState?.paused ? "resume" : "pause";
-    const response = await fetch(`/api/chat/${action}/${currentTaskId}`, { method: "POST" });
+  // 轮卅①：暂停/恢复只作用在「本视图正在看的那个任务」上（A/B 双开时各管各的）。
+  let visibleTask = null;
+  trackedTasks.forEach((t, id) => { if (t.epoch === viewEpoch) visibleTask = id; });
+  if (visibleTask) {
+    const entry = trackedTasks.get(visibleTask);
+    const action = entry.state?.paused ? "resume" : "pause";
+    const response = await fetch(`/api/chat/${action}/${visibleTask}`, { method: "POST" });
     const task = await response.json();
     if (!response.ok) {
       status.textContent = task.detail || "任务状态更新失败";
       return;
     }
-    currentTaskState = task;
+    entry.state = task;
     setComposerState(task.paused ? "paused" : "running");
     status.textContent = task.stage || (task.paused ? "已暂停" : "处理中");
     updateTaskContext(task.stage || (task.paused ? "已暂停" : "处理中"), task.paused ? 55 : 45);
@@ -4777,38 +5236,40 @@ async function sendQuestion() {
         base_url: "https://api.deepseek.com",
         llm_model: "deepseek-flash",
         embedding_model: "BAAI/bge-small-zh-v1.5",
-        answer_style: document.getElementById("answerStyle").value,
-        unit_mode: document.getElementById("unitMode").value,
+        // 轮卅③：回答风格=深度思考开关（关=简洁结论，开=详细讲解）；单位固定「自动」。
+        answer_style: deepThinkOn ? "详细讲解" : "简洁结论",
+        unit_mode: "自动",
         audience: selectedAudience
       })
     });
     const task = await readJson(response, "提问");
-    currentTaskId = task.task_id;
-    currentTaskState = task;
-    pollChatTask(task.task_id, thinking);
+    trackedTasks.set(task.task_id, {
+      thinking, viewSession: currentSessionId, epoch: viewEpoch,
+      question, state: task, timer: null
+    });
+    pollChatTask(task.task_id);
   } catch (error) {
     thinking.remove();
     status.textContent = "请求失败";
     renderResult("", { answer: error.message }, false, false);
-    currentTaskId = null;
-    currentTaskState = null;
     chatStarting = false;
     setComposerState("idle");
   }
 }
 
-async function pollChatTask(taskId, thinking) {
-  // 只跟当前任务：新建会话/换问题后旧轮询链必须自己退出，否则同一答案渲染两遍、会话还会被改回去。
-  if (!taskId || taskId !== currentTaskId) return;
+async function pollChatTask(taskId) {
+  // 轮卅①：轮询链跟着任务表走，不再跟着「唯一当前任务」走——
+  // 任务被删除/取消追踪（entry 不在表里）才自然退出；换了视图照跑，只是不往屏上画。
+  const entry = trackedTasks.get(taskId);
+  if (!entry) return;
+  const visible = () => entry.epoch === viewEpoch;
+  const thinking = entry.thinking;
   try {
     const response = await fetch(`/api/chat/status/${taskId}`);
     const task = await readJson(response, "任务状态");
-    if (taskId !== currentTaskId) {
-      thinking.remove();
-      return;
-    }
-    currentTaskState = task;
-    renderSqlLogs(task.logs || [], task.status);
+    if (!trackedTasks.has(taskId)) return;  // 等待期间被取消追踪
+    entry.state = task;
+    if (visible()) renderSqlLogs(task.logs || [], task.status);
     const bubble = thinking.querySelector(".bubble");
     // ★ 环常驻，只改文字：轮询是 600ms 一次，以前这里每次都用 innerHTML 重写整块气泡，
     //   等于每 600ms 把 .thinking-dots 拆掉重建 ⇒ CSS 动画每次都从 0° 重新开始，
@@ -4824,58 +5285,62 @@ async function pollChatTask(taskId, thinking) {
     const ringLabel = ring.nextSibling;
     if (task.status === "paused") {
       ring.classList.add("paused");
-      if (ringLabel && ringLabel.nodeValue !== "已暂停") ringLabel.nodeValue = "已暂停";
-      setComposerState("paused");
-      document.getElementById("status").textContent = "已暂停，点击继续";
-      updateTaskContext("已暂停", 55);
+      if (visible()) {
+        if (ringLabel && ringLabel.nodeValue !== "已暂停") ringLabel.nodeValue = "已暂停";
+        setComposerState("paused");
+        document.getElementById("status").textContent = "已暂停，点击继续";
+        updateTaskContext("已暂停", 55);
+      }
     } else if (task.status === "running") {
       ring.classList.remove("paused");
       const stageText = task.stage || "处理中";
-      if (ringLabel && ringLabel.nodeValue !== stageText) ringLabel.nodeValue = stageText;
-      setComposerState("running");
-      document.getElementById("status").textContent = task.stage || "处理中";
-      updateTaskContext(task.stage || "处理中", 58);
+      if (visible()) {
+        if (ringLabel && ringLabel.nodeValue !== stageText) ringLabel.nodeValue = stageText;
+        setComposerState("running");
+        document.getElementById("status").textContent = task.stage || "处理中";
+        updateTaskContext(task.stage || "处理中", 58);
+      }
     } else if (task.status === "completed") {
+      trackedTasks.delete(taskId);
       thinking.remove();
       const result = task.result || {};
-      currentSessionId = result.session_id || currentSessionId;
-      renderSqlLogs(result.execution_logs || task.logs || [], "completed");
-      renderResult("", result, false, false);
-      document.getElementById("status").textContent = "分析完成";
-      currentTaskId = null;
-      currentTaskState = null;
-      chatStarting = false;
-      setComposerState("idle");
-      updateSessionContext(currentSessionId ? "当前会话" : "新会话", "分析已完成");
-      updateTaskContext("分析完成", 100);
-      loadHistory();
+      loadHistory();  // 恒刷新：后台完成的任务也要立刻在侧栏露出来
+      if (visible()) {
+        currentSessionId = result.session_id || currentSessionId;
+        renderSqlLogs(result.execution_logs || task.logs || [], "completed");
+        renderResult("", result, false, false);
+        document.getElementById("status").textContent = "分析完成";
+        chatStarting = false;
+        setComposerState("idle");
+        updateSessionContext(currentSessionId ? "当前会话" : "新会话", "分析已完成");
+        updateTaskContext("分析完成", 100);
+      }
       return;
     } else {
+      trackedTasks.delete(taskId);
       thinking.remove();
-      document.getElementById("status").textContent = "处理失败";
-      renderSqlLogs(task.logs || [], "failed");
-      renderResult("", { answer: task.error || "任务处理失败" }, false, false);
-      currentTaskId = null;
-      currentTaskState = null;
+      loadHistory();
+      if (visible()) {
+        document.getElementById("status").textContent = "处理失败";
+        renderSqlLogs(task.logs || [], "failed");
+        renderResult("", { answer: task.error || "任务处理失败" }, false, false);
+        chatStarting = false;
+        setComposerState("idle");
+        updateTaskContext("处理失败", 100);
+      }
+      return;
+    }
+    entry.timer = setTimeout(() => pollChatTask(taskId), 600);
+  } catch (error) {
+    trackedTasks.delete(taskId);
+    thinking.remove();
+    if (visible()) {
+      document.getElementById("status").textContent = "请求失败";
+      renderResult("", { answer: error.message }, false, false);
       chatStarting = false;
       setComposerState("idle");
-      updateTaskContext("处理失败", 100);
-      return;
+      updateTaskContext("请求失败", 100);
     }
-    taskPollTimer = setTimeout(() => pollChatTask(taskId, thinking), 600);
-  } catch (error) {
-    if (taskId !== currentTaskId) {
-      thinking.remove();
-      return;
-    }
-    thinking.remove();
-    document.getElementById("status").textContent = "请求失败";
-    renderResult("", { answer: error.message }, false, false);
-    currentTaskId = null;
-    currentTaskState = null;
-    chatStarting = false;
-    setComposerState("idle");
-    updateTaskContext("请求失败", 100);
   }
 }
 
@@ -5081,7 +5546,6 @@ document.getElementById("clearHistory").onclick = async () => {
   loadHistory();
 };
 document.getElementById("newSession").onclick = resetChatSession;
-document.getElementById("logoutBtn").onclick = async () => { await fetch("/api/logout", { method: "POST" }); location.href = "/"; };
 
 document.querySelectorAll("[data-close-chart-modal]").forEach(element => {
   element.addEventListener("click", closeChartPreview);
@@ -5138,11 +5602,7 @@ document.addEventListener("keydown", event => {
   }
 });
 
-document.getElementById("analysisMode").addEventListener("change", () => {
-  saveSettings();
-  syncModeStatus();
-});
-loadSavedSettings();
+document.getElementById("analysisMode").addEventListener("change", syncModeStatus);
 syncModeStatus();
 setComposerState("idle");
 syncComposerSpace();
@@ -5158,7 +5618,165 @@ window.addEventListener("resize", () => {
 // 首帧：页面初始就是新会话（empty-state 在、hero 类已挂在 #page-chat），
 // 把静态坞位里的 composer 一次性搬进 hero 正文流。
 setHeroMode(!!document.querySelector("#messages .empty-state"));
-document.getElementById("saveSettings").onclick = saveSettings;
+
+// —— 轮卅④：侧栏底部账户条（头像+昵称+齿轮）；轮卅一（m08008）：点齿轮进「账户设置」页（同文件库/数据校验），不再弹层。
+const accountCard = document.getElementById("accountCard");
+let accountMe = null;
+
+function paintAccountBar() {
+  if (!accountMe) return;
+  const name = accountMe.display_name || accountMe.username || "本地用户";
+  document.getElementById("accountName").textContent = name;
+  document.getElementById("accountPageName").textContent = name;
+  const sideAvatar = document.getElementById("accountAvatar");
+  const pageAvatar = document.getElementById("accountPageAvatar");
+  for (const avatar of [sideAvatar, pageAvatar]) {
+    avatar.textContent = name.slice(0, 1).toUpperCase();
+    if (accountMe.has_avatar) {
+      avatar.classList.add("has-img");
+      // 带时间戳绕缓存：换头像后不刷新也立刻见新图
+      avatar.style.backgroundImage = `url("/api/avatar?t=${Date.now()}")`;
+    } else {
+      avatar.classList.remove("has-img");
+      avatar.style.backgroundImage = "";
+    }
+  }
+  document.getElementById("accountVersion").textContent = accountMe.version || "FinSight";
+  const profileInput = document.getElementById("profileName");
+  profileInput.placeholder = accountMe.username || "";
+  // 不覆盖用户正在编辑的内容：只在输入框为空时回填已存昵称
+  if (!profileInput.value) profileInput.value = accountMe.display_name || "";
+}
+
+accountCard.onclick = () => switchPage("account");
+// 深链：#account 直达账户设置页（无侧栏钮的账户页给截图验收与收藏用）
+if (location.hash === "#account") switchPage("account");
+document.getElementById("accountGear").onclick = event => {
+  event.stopPropagation();
+  switchPage("account");
+};
+// 轮卅③（m08259）：账户信息/修改密码/关于系统三段手风琴——点了才展开，一次只开一段
+(() => {
+  const sections = [
+    ["secHeadProfile", "secBodyProfile"],
+    ["secHeadPw", "secBodyPw"],
+    ["secHeadAbout", "secBodyAbout"]
+  ].map(pair => ({
+    head: document.getElementById(pair[0]),
+    body: document.getElementById(pair[1])
+  })).filter(s => s.head && s.body);
+  function setOpen(target) {
+    sections.forEach(s => {
+      const open = s === target;
+      s.head.setAttribute("aria-expanded", open ? "true" : "false");
+      s.body.hidden = !open;
+    });
+  }
+  sections.forEach(s => { s.head.onclick = () => setOpen(s.head.getAttribute("aria-expanded") === "true" ? {} : s); });
+  // 保存/改密成功后回执会出现在对应段里——自动展开该段，免得用户看不到提示
+  const profileSave = document.getElementById("profileSave");
+  const pwSave = document.getElementById("pwSave");
+  if (profileSave && sections[0]) profileSave.addEventListener("click", () => setOpen(sections[0]));
+  if (pwSave && sections[1]) pwSave.addEventListener("click", () => setOpen(sections[1]));
+})();
+document.getElementById("accountLogout").onclick = async () => {
+  await fetch("/api/logout", { method: "POST" });
+  location.replace("/login");
+};
+
+// 账户信息卡：昵称+头像（POST /api/profile，后端魔数/2MB 校验）
+const profileNote = document.getElementById("profileNote");
+function setProfileNote(text, kind) {
+  profileNote.textContent = text;
+  profileNote.className = kind ? `account-note ${kind}` : "account-note";
+}
+document.getElementById("profileSave").onclick = async () => {
+  setProfileNote("正在保存…");
+  const payload = { display_name: document.getElementById("profileName").value.trim() };
+  const file = document.getElementById("profileAvatar").files[0];
+  if (file) {
+    try {
+      payload.avatar = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    } catch (_) {
+      setProfileNote("头像读取失败，请换个文件再试", "err");
+      return;
+    }
+  }
+  try {
+    const response = await fetch("/api/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const result = await readJson(response, "保存资料");
+    if (!result.ok) throw new Error(result.detail || "保存失败");
+    setProfileNote("已保存", "ok");
+    await bootstrapAccount();
+  } catch (error) {
+    setProfileNote(error.message || "保存失败", "err");
+  }
+};
+document.getElementById("profileClearAvatar").onclick = async () => {
+  try {
+    await fetch("/api/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clear_avatar: true })
+    });
+    await bootstrapAccount();
+    setProfileNote("头像已移除", "ok");
+  } catch (error) {
+    setProfileNote(error.message || "操作失败", "err");
+  }
+};
+
+// 修改密码卡（POST /api/password；令牌派生自口令⇒改完全站旧 token 自动失效）
+const pwNote = document.getElementById("pwNote");
+function setPwNote(text, kind) {
+  pwNote.textContent = text;
+  pwNote.className = kind ? `account-note ${kind}` : "account-note";
+}
+document.getElementById("pwSave").onclick = async () => {
+  const nw = document.getElementById("pwNew").value;
+  if (nw !== document.getElementById("pwNew2").value) {
+    setPwNote("两次输入的新密码不一致", "err");
+    return;
+  }
+  setPwNote("正在修改…");
+  try {
+    const response = await fetch("/api/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_password: document.getElementById("pwOld").value, new_password: nw })
+    });
+    const result = await readJson(response, "修改密码");
+    if (!result.ok) throw new Error(result.detail || "修改失败");
+    setPwNote("密码已修改，其他设备的登录已失效", "ok");
+    document.getElementById("pwOld").value = "";
+    document.getElementById("pwNew").value = "";
+    document.getElementById("pwNew2").value = "";
+  } catch (error) {
+    setPwNote(error.message || "修改失败", "err");
+  }
+};
+
+async function bootstrapAccount() {
+  try {
+    accountMe = await readJson(await fetch("/api/me"), "账户状态");
+  } catch (error) {
+    document.getElementById("accountName").textContent = "账户不可用";
+    return;
+  }
+  // 轮卅②：主界面拿到 logged:false（登录被摘/过期）就跳回登录页，不给「两页并存」留窗口。
+  if (accountMe.logged === false) { location.replace("/login"); return; }
+  paintAccountBar();
+}
+bootstrapAccount();
 loadRecommendations().then(pickSuggestions);
 loadSummary();
 loadHistory();

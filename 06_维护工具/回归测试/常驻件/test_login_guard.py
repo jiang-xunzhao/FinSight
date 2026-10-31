@@ -95,6 +95,11 @@ if gate_on:
             check("带 cookie GET / → 200", s5 == 200, f"{s5}")
         s6, _, _ = call("POST", "/api/login", {"username": user, "password": pwd + "X"})
         check("错口令 → 401", s6 == 401, f"{s6}")
+        # 轮卅②：登录页与主界面互斥——已登录访问 /login 必须被弹回 /
+        s9, h9, _ = call("GET", "/login", headers={"Cookie": cookie})
+        check("已登录访问 /login → 302 回主页", s9 == 302 and h9.get("Location") == "/", f"{s9} {h9.get('Location')}")
+        s10, _, b10 = call("GET", "/api/me", headers={"Cookie": cookie})
+        check("/api/me 已登录且带版本号", s10 == 200 and "version" in b10, f"{s10}")
     else:
         print("NOTE：测试进程环境没有 LOGIN_USER/LOGIN_PASSWORD，跳过 cookie 往返（服务却开着闸门=配置不同步？）")
     s7, _, _ = call("GET", "/api/history/does-not-exist", headers={"X-FinSight-Test": "1"})

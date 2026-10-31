@@ -1,7 +1,7 @@
 """项目内回归集的**唯一运行入口**：串行跑 `常驻件/` 全部回归件 + 可选四层深测。
 
 用法（venv python）：
-    python run_all.py                # 只跑常驻件（27 项）
+    python run_all.py                # 只跑常驻件（46 项）
     python run_all.py --layers       # 常驻件跑完再跑四层深测（会重写报告，带时间戳）
     python run_all.py --quick        # 跳过两个最慢的件（test_ingest_gate 建一次性库、test_end_to_end 走模型）
     python run_all.py --only alias gate   # 只跑名字含这些关键字的件
@@ -70,6 +70,7 @@ SUITES: list[tuple[str, bool, bool]] = [
     ("check_web_frontend.py", True, False),
     ("test_http_guards.py", True, False),
     ("test_login_guard.py", True, False),
+    ("test_multiwindow_and_account.py", True, False),
     ("live_import_duplicate_smoke.py", True, False),
     ("test_history_followup.py", True, False),
     ("test_chart_contract.py", False, False),
