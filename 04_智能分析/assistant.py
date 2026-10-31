@@ -5569,6 +5569,7 @@ def handle_chat_request(request: dict[str, Any]) -> dict[str, Any]:
     question = str(request.get("question", "")).strip()
     if not question:
         raise ValueError("问题不能为空")
+    thinking_started = time.perf_counter()  # 「已思考 N 秒」= 从理解问题到结果成型
     request = dict(request)
     request = configure_analysis_mode(request)
     session = find_chat_session(str(request.get("session_id") or ""))
@@ -5839,6 +5840,8 @@ def handle_chat_request(request: dict[str, Any]) -> dict[str, Any]:
     )
     result["execution_logs"] = list(request.get("_log_events") or [])
     result["sources"] = []
+    # 先写思考时长再落会话：历史里重开这条回答也带着它
+    result["thinking_seconds"] = round(time.perf_counter() - thinking_started, 2)
     update_session_analysis_context(session, question, result)
     session = append_session_exchange(session, question, result)
     result["session_id"] = session["id"]

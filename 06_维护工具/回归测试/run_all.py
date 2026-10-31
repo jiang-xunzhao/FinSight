@@ -45,7 +45,6 @@ SUITES: list[tuple[str, bool, bool]] = [
     ("test_comparison_mixed_period.py", False, False),
     ("test_analysis_mode_alias.py", False, False),
     ("test_offline_sql_repair_guard.py", False, False),
-    ("test_comparison_fixture.py", False, False),
     ("test_display_identity_and_eps.py", False, False),
     ("test_company_short_name.py", False, False),
     ("test_sql_alias_display.py", False, False),

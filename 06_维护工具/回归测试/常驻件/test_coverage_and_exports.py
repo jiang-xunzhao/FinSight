@@ -9,6 +9,10 @@ r"""钉住轮廿五「⑦ 功能」那一批的实测结论（引用点原文 / 
 ② 导出与引用（全在 `05_Web服务\\web.py`）：回答可导出 MD / Word、表格可导出 Excel、
    SQL 日志一键复制、证据里的「打开原文」必须带 `#page=N`（`/api/documents/open/<id>`
    是 inline 返回 PDF 字节，浏览器阅读器认这个片段）。
+   ★轮廿九真踩过（所以 [3a] 是**动态断言**、不再只 grep 源码）：后端 docx 的证据段曾按
+   嵌套结构（`item["report_text"]`）去读，而 `build_evidence_chain` 产出的是**扁平** dict
+   （`{"type": "report_text"|"metric_source"|"data_limit", ...}`）——每条被跳过，
+   「数据依据」整章空白，页面上却照常渲染（前端按扁平 type 处理），纯源码 grep 抓不到。
 
 ③ 结构性守卫（本轮真踩过）：web.py 里 `</body>`/`</html>` **只允许出现在完整页面文档的
    末尾**（轮卅八起恰两处：主页 + LOGIN_HTML 登录页）。导出用的 HTML 字符串必须写成
@@ -138,6 +142,76 @@ check("Word 导出后端化：真 .docx + A4 纵向 + 三线表 + 表头跨页",
       '"/api/export/docx"' in WEB_TEXT and "def build_answer_docx" in WEB_TEXT
       and "WD_ORIENT.PORTRAIT" in WEB_TEXT and '"w:tblHeader"' in WEB_TEXT)
 check("MD/Word 共用同一份内容结构", "function answerSections" in WEB_TEXT)
+check("MD 导出也带数据说明（data_limit 不再静默丢）", 'item.type === "data_limit"' in WEB_TEXT)
+
+print()
+print("[3a] docx 导出「数据依据」动态断言（扁平证据链，防轮廿九空章回归）")
+import io as _io
+import zipfile as _zip
+
+try:
+    import web as _web
+    _FLAT_EVIDENCE = [
+        {"type": "report_text", "company_ticker": "000538", "company_name": "云南白药",
+         "file_name": "云南白药_2026年半年报.pdf", "document_id": "doc-test",
+         "page_no": 12, "excerpt": "管理层讨论与分析：公司主营业务收入保持稳定。"},
+        {"type": "metric_source", "company_ticker": "000538", "company_name": "云南白药",
+         "report_period": "2026年半年报", "metrics": [{"label": "营业收入", "value": "218.84 亿元"}],
+         "missing": ["毛利率"], "calculation": "net_profit/revenue"},
+        {"type": "data_limit", "items": ["本期仅有半年报数据"]},
+    ]
+    _RESULT_FULL = {
+        "question": "云南白药 2026年半年报 营业收入", "answer": "营业收入 218.84 亿元。",
+        "company_name": "云南白药", "report_period": "2026年半年报",
+        "key_points": ["营收稳定"], "evidence": list(_FLAT_EVIDENCE),
+        "table": [{"指标": "营业收入", "数值": "218.84 亿元"}],
+        "warnings": ["仅供学习参考"],
+    }
+    _RESULT_NO_TABLE = dict(_RESULT_FULL, table=None, key_points=[], warnings=[])
+    _RESULT_MERGED = {  # 服务器真实形态：数值证据把原文并进 metric_source（file_name/page_no 在同一条上）
+        "question": "云南白药 2026年半年报 营业收入", "answer": "营业收入 218.84 亿元。",
+        "company_name": "云南白药集团股份有限公司", "report_period": "2026年半年报",
+        "key_points": [], "warnings": [],
+        "evidence": [{"type": "metric_source", "company_name": "云南白药集团股份有限公司",
+                      "report_period": "2026年半年报",
+                      "metrics": [{"label": "营业收入", "value": "218.84 亿元"},
+                                  {"label": "净利润", "value": "36.97 亿元"}],
+                      "missing": [], "file_name": "000538_云南白药_2026年半年报告.pdf",
+                      "page_no": 97, "calculation": ""}],
+        "table": [{"指标": "营业收入", "数值": "218.84 亿元"}],
+    }
+    _RESULT_STR_EV = {  # 证据是纯字符串的老形态
+        "question": "测试", "answer": "答案", "company_name": "", "report_period": "",
+        "key_points": [], "warnings": [], "table": None,
+        "evidence": ["出处：某报告第 3 页"],
+    }
+    _doc_bytes, _fname = _web.build_answer_docx(_RESULT_FULL)
+    _xml = _zip.ZipFile(_io.BytesIO(_doc_bytes)).read("word/document.xml").decode("utf-8")
+    check("数据依据章节存在且**有内容**（轮廿九的病：有标题没条目）",
+          "数据依据" in _xml and "财报原文｜云南白药" in _xml)
+    check("原文条目带页码与摘录", "第 12 页" in _xml and "管理层讨论与分析" in _xml)
+    check("数据库条目带指标=值、缺数与算式",
+          "营业收入=218.84 亿元" in _xml and "缺数：毛利率" in _xml and "net_profit/revenue" in _xml)
+    check("数据说明（data_limit）进文档", "数据说明｜本期仅有半年报数据" in _xml)
+    check("有表时章节流水号连续 一二三四五",
+          all(t in _xml for t in ("一、分析结论", "二、要点", "三、数据表", "四、数据依据", "五、注意事项")))
+    _doc2, _ = _web.build_answer_docx(_RESULT_NO_TABLE)
+    _xml2 = _zip.ZipFile(_io.BytesIO(_doc2)).read("word/document.xml").decode("utf-8")
+    check("无表无要点时编号不跳号（二、数据依据，不再出现「三、」）",
+          "二、数据依据" in _xml2 and "三、" not in _xml2)
+    _doc3, _ = _web.build_answer_docx(_RESULT_MERGED)
+    _xml3 = _zip.ZipFile(_io.BytesIO(_doc3)).read("word/document.xml").decode("utf-8")
+    check("数值证据自带原文出处时，「财报原文/数据库」两行都要出（服务器实测形态）",
+          "财报原文｜云南白药集团股份有限公司" in _xml3 and "第 97 页" in _xml3
+          and "营业收入=218.84 亿元" in _xml3 and "净利润=36.97 亿元" in _xml3)
+    _doc4, _ = _web.build_answer_docx(_RESULT_STR_EV)
+    _xml4 = _zip.ZipFile(_io.BytesIO(_doc4)).read("word/document.xml").decode("utf-8")
+    check("纯字符串证据不再被整条丢弃（轮廿九第一版的第二种死法）",
+          "出处：某报告第 3 页" in _xml4)
+except Exception as exc:
+    check("docx 导出动态断言可运行", False, f"{type(exc).__name__}: {exc}")
+check("结果卡显示思考时长（两位小数）", "thinking_seconds" in WEB_TEXT and "已思考" in WEB_TEXT)
+check("登录输入框防自动填充白底", "-webkit-autofill" in WEB_TEXT and "-webkit-box-shadow: 0 0 0 1000px" in WEB_TEXT)
 check("表格导出 Excel", "function tableExcelHtml" in WEB_TEXT and "下载表格 Excel" in WEB_TEXT)
 check("CSV 文件名跟着问题走（不再固定 financial_result.csv）",
       'link.download = exportFileName(result, "csv");' in WEB_TEXT)

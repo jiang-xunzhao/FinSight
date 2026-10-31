@@ -340,16 +340,17 @@ def build_answer_docx(result: dict) -> tuple[bytes, str]:
             paragraph.paragraph_format.first_line_indent = docx_pt(21)
         docx_run_style(paragraph.add_run(text), size=11)
 
-    heading("一、分析结论")
+    section_num = iter(("一", "二", "三", "四", "五", "六"))
+    heading("{}、分析结论".format(next(section_num)))
     body(docx_answer_sentence(result) or "（本次回答没有可导出的结论正文）")
     key_points = [str(item).strip() for item in (result.get("key_points") or []) if str(item).strip()]
     if key_points:
-        heading("二、要点")
+        heading("{}、要点".format(next(section_num)))
         for item in key_points:
             body("· " + item, indent=False)
     rows = [row for row in (result.get("table") or []) if isinstance(row, dict)]
     if rows:
-        heading("三、数据表" if key_points else "二、数据表")
+        heading("{}、数据表".format(next(section_num)))
         columns = list(rows[0].keys())
         numeric_column = []
         for column in columns:
@@ -383,40 +384,60 @@ def build_answer_docx(result: dict) -> tuple[bytes, str]:
                 spare = document.add_paragraph()
                 spare.paragraph_format.space_before = docx_pt(3)
                 docx_run_style(spare.add_run(note), size=9, color=DOCX_MUTED)
-    evidence_items = result.get("evidence") or []
+    evidence_items = []
+    for item in (result.get("evidence") or []):
+        if isinstance(item, str):
+            if item.strip():
+                evidence_items.append({"type": "_text", "text": item.strip()})
+        elif isinstance(item, dict) and item:
+            evidence_items.append(item)
     if evidence_items:
-        heading("四、数据依据" if rows else "三、数据依据")
-        for item in evidence_items if isinstance(evidence_items, list) else []:
-            if not isinstance(item, dict):
+        heading("{}、数据依据".format(next(section_num)))
+        for item in evidence_items:
+            etype = str(item.get("type") or "")
+            if etype == "_text":
+                body("· " + item.get("text", ""), indent=False)
                 continue
-            info = item.get("report_text") or {}
-            if info:
-                body(
-                    "· 财报原文｜{company}《{file}》第 {page} 页：{excerpt}".format(
-                        company=info.get("company_name") or "—",
-                        file=info.get("file_name") or "—",
-                        page=info.get("page_no") or "—",
-                        excerpt=str(info.get("excerpt") or "")[:180],
-                    ),
-                    indent=False,
+            if etype == "report_text" or (etype == "metric_source" and str(item.get("file_name") or "").strip()):
+                page = "第 {} 页".format(item.get("page_no")) if item.get("page_no") else ""
+                excerpt = str(item.get("excerpt") or "")[:180]
+                line = "· 财报原文｜{company}《{file}》{page}".format(
+                    company=item.get("company_name") or "—",
+                    file=item.get("file_name") or "—",
+                    page=page,
                 )
-            metric = item.get("metric_source") or {}
-            if metric:
-                body(
-                    "· 数据库｜{company} {period}：{detail}".format(
-                        company=metric.get("company_name") or "—",
-                        period=metric.get("report_period") or "",
-                        detail="；".join(
-                            "{label}={value}".format(label=m.get("label"), value=m.get("value"))
-                            for m in (metric.get("metrics") or [])
-                            if isinstance(m, dict)
-                        ),
-                    ),
-                    indent=False,
-                )
+                if excerpt:
+                    line += "：{}".format(excerpt)
+                body(line, indent=False)
+            if etype != "metric_source":
+                if etype == "data_limit":
+                    for text in item.get("items") or []:
+                        if str(text or "").strip():
+                            body("· 数据说明｜" + str(text).strip(), indent=False)
+                continue
+            # 服务器实测形状：metric_source 一条里同时带 file_name/page_no（原文出处）与 metrics/missing/calculation
+            # （数据库口径）——两行都要出，之前 elif 把出处行整个吃掉，这就是「数据依据」一直空的真因。
+            detail = "；".join(
+                "{label}={value}".format(label=m.get("label"), value=m.get("value"))
+                for m in (item.get("metrics") or [])
+                if isinstance(m, dict)
+            )
+            missing = [str(name) for name in (item.get("missing") or []) if str(name).strip()]
+            if missing:
+                detail = (detail + "；" if detail else "") + "缺数：" + "、".join(missing)
+            if str(item.get("calculation") or "").strip():
+                detail = (detail + "（" if detail else "（") + str(item["calculation"]).strip() + "）"
+            body(
+                "· 数据库｜{company} {period}：{detail}".format(
+                    company=item.get("company_name") or "—",
+                    period=item.get("report_period") or "",
+                    detail=detail or "—",
+                ),
+                indent=False,
+            )
     warnings = [str(item).strip() for item in (result.get("warnings") or []) if str(item).strip()]
     if warnings:
-        heading("五、注意事项")
+        heading("{}、注意事项".format(next(section_num)))
         for item in warnings:
             body("· " + item, indent=False)
 
@@ -517,6 +538,15 @@ LOGIN_HTML = """<!DOCTYPE html>
     background: transparent; color: var(--pure); font: inherit; font-size: 14px; outline: none;
     transition: border-color .3s var(--ease); }
   .field input:focus { border-bottom-color: rgba(53,214,245,.65); }
+  /* 浏览器自动填充会强涂一层白底盖掉 transparent——用整格内阴影压回卡片深色，字色/光标一并锁死 */
+  .field input:-webkit-autofill,
+  .field input:-webkit-autofill:hover,
+  .field input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--pure);
+    caret-color: var(--pure);
+    -webkit-box-shadow: 0 0 0 1000px #101c2c inset;
+    transition: background-color 99999s ease-out;
+  }
   .login-btn { width: 100%; margin-top: 18px; padding: 12px; border: 1px solid rgba(53,214,245,.40); border-radius: 12px;
     font-size: 13px; letter-spacing: .3em; text-indent: .3em; font-weight: 500;
     background: rgba(53,214,245,.07); color: #c9f2fc; cursor: pointer; transition: all .4s var(--ease); }
@@ -931,7 +961,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/export/docx":
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                data, filename = build_answer_docx(payload if isinstance(payload, dict) else {})
+                data, filename = build_answer_docx(
+                    payload.get("result") if isinstance(payload.get("result"), dict) else payload
+                )
                 self.send_response(HTTPStatus.OK)
                 self.send_header(
                     "Content-Type",
@@ -1516,6 +1548,8 @@ INDEX_HTML = r"""
     .answer-action:hover { color: var(--accent); border-color: rgba(57,196,178,.65); }
     /* 动作按钮整组靠右（回答/证据标题不跟着散开），组内留固定间距 */
     .answer-actions { display: flex; gap: 10px; margin-left: auto; }
+    /* 结果底部右对齐的思考时长（后端 thinking_seconds，两位小数） */
+    .think-time { margin-top: 12px; text-align: right; color: #64788d; font-size: 11px; letter-spacing: .06em; }
     .thinking-overlay {
       position: fixed; inset: 0; display: flex;
       align-items: center; justify-content: center;
@@ -4142,6 +4176,9 @@ function answerSections(result) {
         const metrics = (item.metrics || []).map(m => `${m.label}=${m.value}`).join("，");
         return `${item.company_name || "公司数据"} ${item.report_period || ""}：${metrics}`.trim();
       }
+      if (item.type === "data_limit") {
+        return `数据说明：${(item.items || []).join("；")}`;
+      }
       return "";
     }).filter(Boolean),
     warnings: (result.warnings || []).map(item => (typeof item === "string" ? item : JSON.stringify(item))).filter(Boolean),
@@ -4397,6 +4434,7 @@ function renderResult(question, result, replace = false, includeQuestion = true)
       ${result.chart ? chartCardHtml(chartId, result.chart) : ""}
       ${(result.table && result.table.length) || result.chart ? `
         <div class="download-row" id="download_${chartId}"></div>` : ""}
+      ${Number.isFinite(Number(result.thinking_seconds)) ? `<div class="think-time">已思考 ${Number(result.thinking_seconds).toFixed(2)} 秒</div>` : ""}
     </div>`;
   box.appendChild(item);
   item.querySelector('[data-action="copy"]').onclick = async event => {
