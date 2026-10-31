@@ -5,6 +5,7 @@ from __future__ import annotations  # 启用延迟类型注解，兼容较早的
 import errno  # 识别端口占用等系统错误码
 import hashlib  # 计算文件和文本的 SHA256 摘要
 import hmac  # 登录会话令牌的签名与恒时比较
+import io  # 导出 docx：把 python-docx 文档存进内存字节流
 import json  # 读写 JSON 配置、索引和模型结果
 import mimetypes  # 判断上传文件和静态资源的 MIME 类型
 import os  # 处理路径和操作系统相关操作
@@ -37,6 +38,15 @@ import pdfplumber  # 提取 PDF 文本和表格
 import pymysql  # 连接和操作 MySQL 数据库
 import pypdfium2 as pdfium  # 渲染扫描版 PDF 页面
 from docx import Document  # 读取 Word 文档内容
+from docx.enum.section import WD_ORIENT  # 导出 docx：页面方向（A4 纵向总闸）
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT  # 导出 docx：表格单元格垂直对齐
+from docx.enum.text import WD_ALIGN_PARAGRAPH  # 导出 docx：段落对齐
+from docx.oxml import OxmlElement  # 导出 docx：三线表边框/页码域等 OOXML 细节
+from docx.oxml.ns import qn as docx_qn  # 导出 docx：OOXML 属性名限定
+from docx.shared import Cm as docx_cm  # 导出 docx：厘米
+from docx.shared import Mm as docx_mm  # 导出 docx：毫米（A4 页面尺寸）
+from docx.shared import Pt as docx_pt  # 导出 docx：磅（字号/线宽）
+from docx.shared import RGBColor as docx_rgb  # 导出 docx：字体颜色
 from openai import OpenAI  # 调用云端大模型和嵌入模型
 from pymysql.cursors import DictCursor  # 使用字典游标读取数据库结果
 
@@ -98,6 +108,335 @@ def import_job_elapsed(payload: dict) -> float | None:
     except Exception:
         ended = datetime.now()
     return max(0.0, (ended - started).total_seconds())
+
+# —————— 导出：规范 A4 纵向的真 Word 文档（.docx，python-docx 服务端生成） ——————
+# 版式按财务报表惯例：黑体标题/宋体正文、标题块（公司+报告期+单位与口径）、
+# 三线表（上下粗线+表头细线、无竖线、跨页重复表头）、数字列右对齐并加千分位。
+DOCX_INK = (0x1A, 0x1A, 0x1A)  # 正文墨色（近黑）
+DOCX_MUTED = (0x59, 0x59, 0x59)  # 次要信息灰
+DOCX_LINE = "2F5496"  # 三线表横线颜色（深蓝，与深蓝表头底色呼应）
+DOCX_CELL_RE = re.compile(r"^[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?\s*(亿|万)?\s*(元|%)?$")
+DOCX_PURE_NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def docx_run_style(run, *, east="宋体", latin="Times New Roman", size=10.5, bold=False, color=DOCX_INK):
+    """统一设置一个 run 的中西文字体（eastAsia 不设中文会掉回首退字体）。"""
+    run.font.name = latin
+    run.font.size = docx_pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = docx_rgb(*color)
+    run._element.get_or_add_rPr().get_or_add_rFonts().set(docx_qn("w:eastAsia"), east)
+
+
+def docx_cell_text(cell, text, *, east="宋体", size=10.5, bold=False, align="left", color=DOCX_INK):
+    """写单元格：清默认空段、行距固定、垂直居中、指定对齐。"""
+    cell.text = ""
+    paragraph = cell.paragraphs[0]
+    paragraph.paragraph_format.space_before = docx_pt(1)
+    paragraph.paragraph_format.space_after = docx_pt(1)
+    paragraph.paragraph_format.line_spacing = 1.15
+    paragraph.alignment = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+    }[align]
+    docx_run_style(paragraph.add_run(str(text)), east=east, size=size, bold=bold, color=color)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+
+def docx_table_plain(table):
+    """三线表：顶/底 1.5pt 粗线，表头下 0.75pt 细线，无竖线无内横线（直写 OOXML）。"""
+    borders = OxmlElement("w:tblBorders")
+    for tag, edge in (
+        ("top", ("single", "12", DOCX_LINE)),
+        ("bottom", ("single", "12", DOCX_LINE)),
+        ("left", ("none", "0", "auto")),
+        ("right", ("none", "0", "auto")),
+        ("insideH", ("none", "0", "auto")),
+        ("insideV", ("none", "0", "auto")),
+    ):
+        element = OxmlElement(f"w:{tag}")
+        element.set(docx_qn("w:val"), edge[0])
+        element.set(docx_qn("w:sz"), edge[1])
+        element.set(docx_qn("w:space"), "0")
+        element.set(docx_qn("w:color"), edge[2])
+        borders.append(element)
+    # OOXML 对 tblPr 子元素顺序有硬性 schema 规定：tblBorders 必须在 shd/tblLayout/tblLook 之前，
+    # 直接 append 会让 Word 报「内容有错」，所以按后继标签表插位。
+    table._tbl.tblPr.insert_element_before(
+        borders, "w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook",
+        "w:tblCaption", "w:tblDescription", "w:tblPrChange",
+    )
+    table.autofit = True
+
+
+def docx_cell_bottom_border(cell, sz="6"):
+    """表头行的下边线（三线表的中线）——只有这一行有横线。"""
+    borders = OxmlElement("w:tcBorders")
+    element = OxmlElement("w:bottom")
+    element.set(docx_qn("w:val"), "single")
+    element.set(docx_qn("w:sz"), sz)
+    element.set(docx_qn("w:space"), "0")
+    element.set(docx_qn("w:color"), DOCX_LINE)
+    borders.append(element)
+    cell._tc.get_or_add_tcPr().insert_element_before(
+        borders, "w:shd", "w:noWrap", "w:tcMar", "w:textDirection", "w:tcFitText",
+        "w:vAlign", "w:hideMark", "w:headers", "w:cellIns", "w:cellDel", "w:cellMerge", "w:tcPrChange",
+    )
+
+
+def docx_row_repeat_header(row):
+    """跨页时重复这一行（财务报表表格惯例，长表翻页不丢列名）。"""
+    element = OxmlElement("w:tblHeader")
+    element.set(docx_qn("w:val"), "true")
+    row._tr.get_or_add_trPr().append(element)
+
+
+def docx_add_page_field(paragraph, instruction):
+    """页脚里的「第 X 页 共 Y 页」——PAGE/NUMPAGES 是域，Word 打开时才现算。"""
+    begin = OxmlElement("w:fldChar")
+    begin.set(docx_qn("w:fldCharType"), "begin")
+    body = OxmlElement("w:instrText")
+    body.set(docx_qn("xml:space"), "preserve")
+    body.text = f" {instruction} "
+    end = OxmlElement("w:fldChar")
+    end.set(docx_qn("w:fldCharType"), "end")
+    run = paragraph.add_run()
+    run._r.append(begin)
+    run._r.append(body)
+    run._r.append(end)
+    docx_run_style(run, size=9, color=DOCX_MUTED)
+
+
+def docx_is_numeric_cell(value: str) -> bool:
+    text = str(value).strip()
+    if not text:
+        return False
+    matched = DOCX_CELL_RE.fullmatch(text)
+    return bool(matched)
+
+
+def docx_thousands(value: str) -> str:
+    """纯数字（整数部分 ≥5 位）加千分位；带单位后缀的原样——那是界面口径。"""
+    text = str(value).strip()
+    if not DOCX_PURE_NUM_RE.match(text):
+        return text
+    sign = text[0] if text[0] in "+-" else ""
+    head, dot, tail = text.lstrip("+-").partition(".")
+    if len(head) < 5:
+        return text
+    reversed_head = head[::-1]
+    grouped = ",".join(reversed_head[i:i + 3] for i in range(0, len(reversed_head), 3))[::-1]
+    return sign + grouped + (dot + tail if dot else "")
+
+
+def docx_answer_sentence(result: dict) -> str:
+    text = str(result.get("summary") or result.get("answer") or "").strip()
+    if text and text[-1] not in "。！？!?.":
+        text += "。"
+    return text
+
+
+def docx_meta_lines(result: dict) -> tuple[str, str, str]:
+    """标题块三要素：公司 / 报告期 / 金额单位口径——优先取回答里已核对过的信息。"""
+    company = str(result.get("company_name") or "").strip()
+    period = ""
+    unit_parts: list[str] = []
+    for item in result.get("evidence") or []:
+        info = item.get("metric_source") or {} if isinstance(item, dict) else {}
+        company = company or str(info.get("company_name") or "").strip()
+        period = period or str(info.get("report_period") or "").strip()
+        for metric in info.get("metrics") or []:
+            value = str((metric or {}).get("value") or "")
+            for token in ("亿元", "万元", "元"):
+                if value.endswith(token) and token not in unit_parts:
+                    unit_parts.append(token)
+    rows = result.get("table") or []
+    first = rows[0] if rows and isinstance(rows[0], dict) else {}
+    company = company or str(first.get("公司名称") or "").strip()
+    period = period or str(first.get("报告期") or "").strip()
+    if not period:
+        try:
+            period = period_phrase_from_text(str(result.get("question") or ""))
+        except Exception:
+            period = ""
+    if not unit_parts:
+        for row in rows:
+            for value in (row or {}).values():
+                text = str(value)
+                for token in ("亿元", "万元"):
+                    if text.endswith(token) and token not in unit_parts:
+                        unit_parts.append(token)
+    unit = "金额单位：" + "、".join(unit_parts) if unit_parts else ""
+    return company, period, unit
+
+
+def build_answer_docx(result: dict) -> tuple[bytes, str]:
+    """把一条问答结果排成规范 A4 纵向 .docx，返回 (字节, 建议文件名)。"""
+    result = result if isinstance(result, dict) else {}
+    document = Document()
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.PORTRAIT  # 强制纵向：即使模板是横向也掰回来
+    section.page_width, section.page_height = docx_mm(210), docx_mm(297)
+    section.left_margin = section.right_margin = docx_cm(2.5)
+    section.top_margin = docx_cm(2.5)
+    section.bottom_margin = docx_cm(2.2)
+    normal = document.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = docx_pt(10.5)
+    normal.element.get_or_add_rPr().get_or_add_rFonts().set(docx_qn("w:eastAsia"), "宋体")
+
+    company, period, unit = docx_meta_lines(result)
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = docx_pt(2)
+    docx_run_style(title.add_run(company or "上市公司财务数据报表"), east="黑体", size=16, bold=True)
+    if company:
+        subtitle = document.add_paragraph()
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        subtitle.paragraph_format.space_after = docx_pt(2)
+        docx_run_style(subtitle.add_run("财务数据分析报表"), east="黑体", size=13, bold=True)
+    meta_bits = [bit for bit in (period, unit, "数据来源：FinSight 财报智析") if bit]
+    meta = document.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.paragraph_format.space_after = docx_pt(6)
+    docx_run_style(meta.add_run("　｜　".join(meta_bits)), size=9, color=DOCX_MUTED)
+    rule = document.add_paragraph()
+    rule.paragraph_format.space_after = docx_pt(8)
+    rule_borders = OxmlElement("w:pBdr")
+    bottom_line = OxmlElement("w:bottom")
+    bottom_line.set(docx_qn("w:val"), "single")
+    bottom_line.set(docx_qn("w:sz"), "6")
+    bottom_line.set(docx_qn("w:space"), "1")
+    bottom_line.set(docx_qn("w:color"), DOCX_LINE)
+    rule_borders.append(bottom_line)
+    # pPr 同理：pBdr 必须排在 spacing/ind/jc 等后继元素之前。
+    rule._p.get_or_add_pPr().insert_element_before(
+        rule_borders, "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap",
+        "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi",
+        "w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing",
+        "w:mirrorIndents", "w:suppressOverlap", "w:jc", "w:textDirection", "w:textAlignment",
+        "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+    )
+
+    question = str(result.get("question") or "").strip()
+    if question:
+        topic = document.add_paragraph()
+        topic.paragraph_format.space_after = docx_pt(6)
+        docx_run_style(topic.add_run("分析主题："), east="黑体", size=11, bold=True)
+        docx_run_style(topic.add_run(question), size=11)
+
+    def heading(text):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.space_before = docx_pt(8)
+        paragraph.paragraph_format.space_after = docx_pt(3)
+        docx_run_style(paragraph.add_run(text), east="黑体", size=12, bold=True)
+
+    def body(text, *, indent=True):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.space_after = docx_pt(3)
+        paragraph.paragraph_format.line_spacing = 1.3
+        if indent:
+            paragraph.paragraph_format.first_line_indent = docx_pt(21)
+        docx_run_style(paragraph.add_run(text), size=11)
+
+    heading("一、分析结论")
+    body(docx_answer_sentence(result) or "（本次回答没有可导出的结论正文）")
+    key_points = [str(item).strip() for item in (result.get("key_points") or []) if str(item).strip()]
+    if key_points:
+        heading("二、要点")
+        for item in key_points:
+            body("· " + item, indent=False)
+    rows = [row for row in (result.get("table") or []) if isinstance(row, dict)]
+    if rows:
+        heading("三、数据表" if key_points else "二、数据表")
+        columns = list(rows[0].keys())
+        numeric_column = []
+        for column in columns:
+            # 代码/编号列长得像数字但是身份列：不右对齐、不加千分位（600422≠600,422）
+            if "代码" in column or "编号" in column:
+                numeric_column.append(False)
+                continue
+            values = [str(row.get(column) if row.get(column) is not None else "") for row in rows]
+            numeric_column.append(
+                bool(values) and sum(docx_is_numeric_cell(v) for v in values) >= max(1, int(len(values) * 0.7))
+            )
+        table = document.add_table(rows=len(rows) + 1, cols=len(columns))
+        docx_table_plain(table)
+        for index, column in enumerate(columns):
+            cell = table.rows[0].cells[index]
+            docx_cell_text(cell, column, east="黑体", size=10, bold=False, align="center")
+            docx_cell_bottom_border(cell)
+        docx_row_repeat_header(table.rows[0])
+        for row_index, row in enumerate(rows, start=1):
+            for column_index, column in enumerate(columns):
+                raw = str(row.get(column) if row.get(column) is not None else "")
+                align = "right" if numeric_column[column_index] and raw.strip() else "left"
+                docx_cell_text(
+                    table.rows[row_index].cells[column_index],
+                    docx_thousands(raw),
+                    size=10,
+                    align=align,
+                )
+        for note in (str(result.get("chart_note") or "").strip(),):
+            if note:
+                spare = document.add_paragraph()
+                spare.paragraph_format.space_before = docx_pt(3)
+                docx_run_style(spare.add_run(note), size=9, color=DOCX_MUTED)
+    evidence_items = result.get("evidence") or []
+    if evidence_items:
+        heading("四、数据依据" if rows else "三、数据依据")
+        for item in evidence_items if isinstance(evidence_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            info = item.get("report_text") or {}
+            if info:
+                body(
+                    "· 财报原文｜{company}《{file}》第 {page} 页：{excerpt}".format(
+                        company=info.get("company_name") or "—",
+                        file=info.get("file_name") or "—",
+                        page=info.get("page_no") or "—",
+                        excerpt=str(info.get("excerpt") or "")[:180],
+                    ),
+                    indent=False,
+                )
+            metric = item.get("metric_source") or {}
+            if metric:
+                body(
+                    "· 数据库｜{company} {period}：{detail}".format(
+                        company=metric.get("company_name") or "—",
+                        period=metric.get("report_period") or "",
+                        detail="；".join(
+                            "{label}={value}".format(label=m.get("label"), value=m.get("value"))
+                            for m in (metric.get("metrics") or [])
+                            if isinstance(m, dict)
+                        ),
+                    ),
+                    indent=False,
+                )
+    warnings = [str(item).strip() for item in (result.get("warnings") or []) if str(item).strip()]
+    if warnings:
+        heading("五、注意事项")
+        for item in warnings:
+            body("· " + item, indent=False)
+
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    foot = footer.paragraphs[0]
+    foot.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    docx_run_style(foot.add_run("FinSight 财报智析 · 生成于 {time} · 第 ".format(time=datetime.now().strftime("%Y-%m-%d %H:%M"))), size=9, color=DOCX_MUTED)
+    docx_add_page_field(foot, "PAGE")
+    docx_run_style(foot.add_run(" 页，共 "), size=9, color=DOCX_MUTED)
+    docx_add_page_field(foot, "NUMPAGES")
+    docx_run_style(foot.add_run(" 页"), size=9, color=DOCX_MUTED)
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    stem = "_".join(bit for bit in (company or "上市公司", period or "财务数据") if bit)
+    stem = re.sub(r'[\\/:*?"<>|\s]+', "", stem)[:60]
+    name = "{stem}_财务数据报表_{stamp}.docx".format(stem=stem, stamp=datetime.now().strftime("%Y%m%d"))
+    return buffer.getvalue(), name
+
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -589,6 +928,25 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length) or b"{}")
                 self.send_json(handle_chat_request(request))
+            elif path == "/api/export/docx":
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                data, filename = build_answer_docx(payload if isinstance(payload, dict) else {})
+                self.send_response(HTTPStatus.OK)
+                self.send_header(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                # 中文文件名走 RFC 5987；另留一份 ASCII 兜底给不认 filename* 的老客户端
+                self.send_header(
+                    "Content-Disposition",
+                    "attachment; filename=FinSight_report.docx; filename*=UTF-8''{quoted}".format(
+                        quoted=quote(filename)
+                    ),
+                )
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif path == "/api/system/shutdown":
                 self.send_json({"status": "shutting_down"})
                 if SERVER_INSTANCE is not None:
@@ -4024,7 +4382,7 @@ function renderResult(question, result, replace = false, includeQuestion = true)
         <div class="answer-actions">
           <button class="answer-action" data-action="copy">复制</button>
           <button class="answer-action" data-action="md" title="存成 .md 文件">导出 MD</button>
-          <button class="answer-action" data-action="word" title="存成 Word 能直接打开的 .doc">导出 Word</button>
+          <button class="answer-action" data-action="word" title="存成规范 A4 版式的 Word 文档（.docx）">导出 Word</button>
         </div>
       </div>
       <div class="answer-summary">${summaryHtml}</div>
@@ -4061,10 +4419,45 @@ function renderResult(question, result, replace = false, includeQuestion = true)
   }
   const wordButton = item.querySelector('[data-action="word"]');
   if (wordButton) {
-    // BOM 是给老 Word 认 UTF-8 用的，少了它中文会花。
-    wordButton.onclick = () => {
-      downloadText("\ufeff" + answerWordHtml(result), "application/msword;charset=utf-8", exportFileName(result, "doc"));
-      flashAction(wordButton, "导出 Word");
+    // 正路：让后端用 python-docx 排一份规范 A4 纵向的真 .docx（三线表/千分位/页码域）。
+    wordButton.onclick = async () => {
+      const original = "导出 Word";
+      wordButton.textContent = "生成中…";
+      wordButton.disabled = true;
+      try {
+        const response = await fetch("/api/export/docx", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            question: result.question,
+            summary: result.summary || result.answer,
+            key_points: result.key_points,
+            table: result.table,
+            evidence: result.evidence,
+            warnings: result.warnings,
+            chart_note: result.chart_note,
+            company_name: result.company_name
+          })
+        });
+        if (!response.ok) throw new Error(String(response.status));
+        const disposition = response.headers.get("Content-Disposition") || "";
+        const matched = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+        const name = matched ? decodeURIComponent(matched[1]) : exportFileName(result, "docx");
+        const blob = await response.blob();
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = name;
+        link.click();
+        URL.revokeObjectURL(link.href);
+        flashAction(wordButton, original);
+      } catch (error) {
+        // 兜底：老的前端拼 .doc 路（万一打到没升级的服务器也不至于导出无门）。
+        // BOM 是给老 Word 认 UTF-8 用的，少了它中文会花。
+        downloadText("\ufeff" + answerWordHtml(result), "application/msword;charset=utf-8", exportFileName(result, "doc"));
+        flashAction(wordButton, original);
+      } finally {
+        wordButton.disabled = false;
+      }
     };
   }
   item.querySelectorAll(".clarify-chip").forEach(button => {

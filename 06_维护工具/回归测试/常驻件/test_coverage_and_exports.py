@@ -134,6 +134,9 @@ check("打开时带 #page= 片段（PDF 阅读器直接翻到那页）", "#page=
 check("按钮回退文案按原始文本恢复（不写死「打开原文」）", "const original = button.textContent;" in WEB_TEXT)
 check("回答导出 MD", 'data-action="md"' in WEB_TEXT and "function answerMarkdown" in WEB_TEXT)
 check("回答导出 Word", 'data-action="word"' in WEB_TEXT and "function answerWordHtml" in WEB_TEXT)
+check("Word 导出后端化：真 .docx + A4 纵向 + 三线表 + 表头跨页",
+      '"/api/export/docx"' in WEB_TEXT and "def build_answer_docx" in WEB_TEXT
+      and "WD_ORIENT.PORTRAIT" in WEB_TEXT and '"w:tblHeader"' in WEB_TEXT)
 check("MD/Word 共用同一份内容结构", "function answerSections" in WEB_TEXT)
 check("表格导出 Excel", "function tableExcelHtml" in WEB_TEXT and "下载表格 Excel" in WEB_TEXT)
 check("CSV 文件名跟着问题走（不再固定 financial_result.csv）",
