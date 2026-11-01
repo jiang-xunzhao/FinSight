@@ -2,7 +2,7 @@
 
 设计约束（都是这个会话踩出来的）：
 - **只读**：全部走 SQL 与已入库的 `6_rag_chunks` 文本，绝不重跑 OCR、绝不写库。
-  需要重解析的验证交给 `_tools\reimport_by_code.py` + 常驻件，不在这里做。
+  需要重解析的验证交给 `10_运维与历史归档\reimport_by_code.py` + 常驻件，不在这里做。
 - 每条缺陷必须能定位到**文档名**（从 `7_document_index` 反查），否则报告没法复现。
 - 期望值一律来自 `samples.ORACLE`（唯一一份真值登记表），这里不写死数字。
 - 判定与报告分离：P0/P1 计入结论，P2/P3 只报告（倍率>2 这类证据不足的不许自动定罪，
@@ -152,7 +152,7 @@ def layer_core_reports() -> list[dict[str, Any]]:
                         "L1 核心报表勾稽", "P2", doc, code, str(perf["report_period"]),
                         "net_profit vs net_profit_parent",
                         "合并净利润不应远大于母公司（子公司亏损只会让合并更小）", f"倍率 {ratio:.1f}×",
-                        "python _tools\\probe_minority_identity.py " + code,
+                        "python 10_运维与历史归档\\probe_minority_identity.py " + code,
                         "多半是把「综合收益总额」或母公司净利润接到了合并口径上 ⇒ 回原文判",
                     ))
         for key in expect.get("expect_dropped", []) or []:
@@ -479,7 +479,7 @@ def layer_anomaly() -> list[dict[str, Any]]:
                 f"{r['stock_code']}×{r['n']}" for r in dup[:8]),
             "SELECT stock_code, report_period, file_name, COUNT(*) FROM 7_document_index "
             "GROUP BY 1,2,3 HAVING COUNT(*)>1",
-            "同一份报告被反复上传（多数是截断件）⇒ _tools\\dedupe_documents.py 按「切片最多」保留一份",
+            "同一份报告被反复上传（多数是截断件）⇒ 10_运维与历史归档\\dedupe_documents.py 按「切片最多」保留一份",
         ))
     # 10) 文档行必须有原文（实测事故：`POST /api/import/start {}` 曾把 25 份已入库原文删掉）
     missing_files = [
@@ -493,8 +493,8 @@ def layer_anomaly() -> list[dict[str, Any]]:
             "0 行的 file_path 指向不存在的文件",
             f"{len(missing_files)} 行：file_path 在盘上不存在",
             "SELECT id, file_name, file_path FROM 7_document_index（在 python 里逐条 exists 判定）",
-            "点开文档报「文件不存在」、也没法重导 ⇒ 恢复：_tools\\restore_missing_uploads.py（按备份的"
-            "文件名+sha256 复核）；防再犯：_tools\\dedupe_documents.py 不搬文件、"
+            "点开文档报「文件不存在」、也没法重导 ⇒ 恢复：10_运维与历史归档\\restore_missing_uploads.py（按备份的"
+            "文件名+sha256 复核）；防再犯：10_运维与历史归档\\dedupe_documents.py 不搬文件、"
             "test_import_delete_safety.py 钉住「删之前先查引用」",
         ))
     return out

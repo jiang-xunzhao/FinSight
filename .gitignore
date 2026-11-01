@@ -9,16 +9,16 @@ storage/uploads/
 # ---- FinSight 迁移补充（2026-10-29）：本地数据/备份/临时件一律不进仓库 ----
 storage/
 _tmp/
-legacy/
+11_旧版代码/
 .idea/
 out/
 output/
-_tools/_hist/
-_tools/scratch/
-_tools/_migrated/
-_tools/落库历史/
-_tools/重复文件隔离/
-_tools/*.bak*
+10_运维与历史归档/_hist/
+10_运维与历史归档/scratch/
+10_运维与历史归档/_migrated/
+10_运维与历史归档/落库历史/
+10_运维与历史归档/重复文件隔离/
+10_运维与历史归档/*.bak*
 *.bak_round*
 *.bak_*
 *.bak
@@ -28,6 +28,12 @@ server-runtime*.log
 Thumbs.db
 # ---- 公开发布前补充（2026-10-30）：含口令/本机数据/内部工具，绝不进 GitHub ----
 FinSight_改动清单.md
-_tools/
-预览/
+10_运维与历史归档/
+# 预览已搬入 09_展示素材图片\预览效果图（随 09 整目录忽略）
 .pytest_cache/
+
+# 轮卅六合并：本地归档目录（答辩资料/管线脚本/图像素材，不推 GitHub）
+07_申报与展示材料/
+08_部署与验证管线/
+09_展示素材图片/
+项目合并说明.md

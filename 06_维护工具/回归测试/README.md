@@ -37,7 +37,7 @@ $py = "C:\Users\35999\PyCharmMiscProject\.venv\Scripts\python.exe"
 
 # ③ 全量冒烟导入（≈55-65 分钟，**必须先停服务**：内嵌 Qdrant 独占文件锁）
 python finsight_launch.py --stop
-& $py "C:\Users\35999\Desktop\FinSight财报智析\_tools\reimport_all_documents.py"
+& $py "C:\Users\35999\Desktop\FinSight财报智析\10_运维与历史归档\reimport_all_documents.py"
 python finsight_launch.py --restart
 ```
 
@@ -82,8 +82,8 @@ python finsight_launch.py --restart
 | `600085 同仁堂 / 600007 中国国贸` | 「归属于母公司所有者权益（或股东权益）合计」被短别名 `股东权益合计` 抢走；权益变动表里的「净利润」行两列取数 → `profit_yoy` 187200.4271% | `test_cash_forex_and_truncated_label.py`、`test_equity_statement_scope.py` + L1 oracle |
 | `600031 三一重工` | 现金流配不平，差额 `-768,603,000` = 库里**没有列存汇率变动项**（不是解析错） | `fx_cash` 八触点 + `test_cash_forex_and_truncated_label.py`、L4 四段配平 |
 | 校验结论生命周期 | 摘要盖完整版那次 `kept` ⇒ 整组结论被删光不回填（18 个事实行无结论）；重导不清 `9_validation_results` ⇒ 56 行陈旧「异常」 | `test_validation_rows_lifecycle.py`（一次性库真跑 save）、L3 |
-| 重复导入 | `920833` 27 份、`600999` 15 份同名不同字节的截断件全在库（44 行、2059 切片） | `_tools\dedupe_documents.py`（判据=同 `(代码,期间,文件名)` 保留切片最多者）、L3 |
-| **空 `local_dir` 误删原文** | `POST /api/import/start {}` 把**服务进程当前目录**当导入目录扫，重复分支按「路径像托管副本」就 `unlink` ⇒ 实测删掉 **25 份已入库文档的原文**（库行/切片/向量都在，坏的是「点开文档」和「以后重导」） | `常驻件\test_import_delete_safety.py`（删前必须查引用 + 入参必须绝对路径且不含托管根）、`常驻件\test_http_guards.py`、L3「文档原文丢失」判据、恢复件 `_tools\restore_missing_uploads.py` |
+| 重复导入 | `920833` 27 份、`600999` 15 份同名不同字节的截断件全在库（44 行、2059 切片） | `10_运维与历史归档\dedupe_documents.py`（判据=同 `(代码,期间,文件名)` 保留切片最多者）、L3 |
+| **空 `local_dir` 误删原文** | `POST /api/import/start {}` 把**服务进程当前目录**当导入目录扫，重复分支按「路径像托管副本」就 `unlink` ⇒ 实测删掉 **25 份已入库文档的原文**（库行/切片/向量都在，坏的是「点开文档」和「以后重导」） | `常驻件\test_import_delete_safety.py`（删前必须查引用 + 入参必须绝对路径且不含托管根）、`常驻件\test_http_guards.py`、L3「文档原文丢失」判据、恢复件 `10_运维与历史归档\restore_missing_uploads.py` |
 
 ## 写新回归件的规矩
 
@@ -97,5 +97,5 @@ python finsight_launch.py --restart
 - **别写 `hasattr(模块, "不存在的名字")` 当兜底**：恒 False ⇒ 检查静默跳过 ⇒ 覆盖矩阵里显示成假的 ✅（真实事故：`layers.py` 曾调不存在的 `data.vector_store_status()`，导致「向量点数漂移」这项一直没跑）。要么调真实存在的 API，要么读不到就**记一条 P3 并写明原因**，绝不静默通过。这条由 `test_module_refs.py` 静态守住（AST 扫全项目 `data.xxx` / `vector_store.xxx` 引用是否真的存在，196 处引用 0 问题）。
 - 读 .py 源码做静态分析时一律 `encoding="utf-8-sig"`（项目里有些件带 BOM，用 utf-8 读会 `invalid non-printable character U+FEFF`）；判 `data.append(...)` 这类引用要先排**函数内局部变量遮蔽**（`assistant.py:3540` 的 `data = []` 不是模块）。
 - 深测件跑之前必须确认全量冒烟导入已结束：`load_vector_index_status()` 会载入 `storage/rag_chunks.json` 镜像并**打开内嵌 Qdrant 目录**，与导入抢锁。
-- **回归集唯一入口 = 本目录 `run_all.py`**。桌面 `_tools\run_regression.py` 只是转发壳；曾经桌面与项目内各有一份同名件（MD5 相同）⇒ 已把桌面那份移入 `_tools\_migrated\`，不再双份维护。**件数不写死**：`run_all.py` 启动时会比对 `SUITES` 与 `常驻件\*.py`，**有未登记的件就打印并 `return 1`**（实测曾漏 2 件从未被跑而矩阵仍显全绿）⇒ 新增件必须同步登记 `SUITES`。
+- **回归集唯一入口 = 本目录 `run_all.py`**。桌面 `10_运维与历史归档\run_regression.py` 只是转发壳；曾经桌面与项目内各有一份同名件（MD5 相同）⇒ 已把桌面那份移入 `10_运维与历史归档\_migrated\`，不再双份维护。**件数不写死**：`run_all.py` 启动时会比对 `SUITES` 与 `常驻件\*.py`，**有未登记的件就打印并 `return 1`**（实测曾漏 2 件从未被跑而矩阵仍显全绿）⇒ 新增件必须同步登记 `SUITES`。
 

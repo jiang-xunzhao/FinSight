@@ -2,7 +2,7 @@
 """身份卫生回归：公司名清洗/主数据优先 + ON DUPLICATE 长名保护 + 鬼影主体判定。
 
 跑法（服务可不停，只碰临时库 finance_report_hyg）：
-    python _tools\\test_identity_hygiene.py
+    python 10_运维与历史归档\\test_identity_hygiene.py
 """
 from __future__ import annotations
 

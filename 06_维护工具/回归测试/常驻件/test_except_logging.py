@@ -3,7 +3,7 @@
 背景（2026-10-28 静态 AST 审计，276 个函数）：类别1/3-8 全为 0，唯一有料的是类别2 吞异常。
 用户决定：**只加日志，不改行为**。改的三处：
   ① `03_数据层/data.py` `read_pdf` 每页表格提取块（原 `except Exception: pass` ⇒ 某页表格
-     静默丢失，事后无从判断）。探针 `_tools/_hist/probe_swallow_tables_20261028.log`
+     静默丢失，事后无从判断）。探针 `10_运维与历史归档/_hist/probe_swallow_tables_20261028.log`
      实测现有样本 0 次触发 ⇒ 是潜在风险，不是现网缺陷。
   ② `04_智能分析/assistant.py:175-185` `classify_question_task` 里 `extract_metrics`
      异常被吞 ⇒ 意图静默降级成 general，整条链路换掉却没痕迹。
