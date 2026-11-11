@@ -1,11 +1,32 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 title FinSight
-rem Ëß£ÈáäÂô®‰ºòÂÖàÁ∫ßÔºöÈ°πÁõÆÂÜÖ .venv ‚Üí ‰∏äÁ∫ßÁõÆÂΩï .venv ‚Üí Êú¨Êú∫Âõ∫ÂÆö venv ‚Üí PATH ÈáåÁöÑ python
-set "PY=%~dp0.venv\Scripts\python.exe"
-if not exist "%PY%" set "PY=%~dp0..\.venv\Scripts\python.exe"
-if not exist "%PY%" set "PY=C:\Users\35999\PyCharmMiscProject\.venv\Scripts\python.exe"
-if not exist "%PY%" (
+rem ============================================================
+rem Ω‚ Õ∆˜”≈œ»º∂£®2026-11-11 –ﬁ∏ƒ£©£∫
+rem   æ…–¥∑®∞¥°∞ƒø¬º‘⁄≤ª‘⁄°±ÃÙΩ‚ Õ∆˜£¨Ω·π˚œ»ÃÙ÷–¡À“ª∏ˆø’ venv
+rem   £®FinSight\.venv£¨Python 3.14£¨÷ª”– pip£¨13 ∏ˆ“¿¿µ»´»±£©£¨
+rem   √ø¥ŒÀ´ª˜∂º‘⁄œ÷≥° pip œ¬‘ÿ∞≤◊∞£¨º∏∑÷÷”∆≤ª¿¥°£
+rem   –¬–¥∑®∞¥°∞“¿¿µ‘⁄≤ª‘⁄°±ÃÙ£∫À≠ƒ‹ import œ¬√Ê»˝º˛Ã◊æÕ”√À≠£¨
+rem   ∂º≤ª––≤≈ÕÀªÿœÓƒøƒ⁄ .venv£®µ⁄“ª¥Œ”… my_open.py ◊‘∂Ø◊∞“¿¿µ£©°£
+rem ============================================================
+set "PY="
+for %%P in (
+  "C:\Users\35999\PyCharmMiscProject\.venv\Scripts\python.exe"
+  "%~dp0.venv\Scripts\python.exe"
+  "%~dp0..\.venv\Scripts\python.exe"
+) do (
+  if not defined PY (
+    if exist %%P (
+      %%P -c "import pymysql, docx, fastembed" >nul 2>nul
+      if not errorlevel 1 set "PY=%%~P"
+    )
+  )
+)
+
+rem “ª∏ˆ◊∞∆Îµƒ∂º√ª”–£∫∞¥¿œÀ≥–ÚÕÀªÿ£®ª·”… my_open.py ◊‘∂Ø≤π◊∞£©
+if not defined PY if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
+if not defined PY if exist "%~dp0..\.venv\Scripts\python.exe" set "PY=%~dp0..\.venv\Scripts\python.exe"
+if not defined PY (
   where python >nul 2>nul
   if errorlevel 1 (
     echo [FinSight] Python not found. Install deps or fix the venv path in this .bat
@@ -14,12 +35,15 @@ if not exist "%PY%" (
   )
   set "PY=python"
 )
+
 if not exist "%~dp0finsight_launch.py" (
   echo [FinSight] finsight_launch.py is missing next to this .bat
   echo [FinSight] Run deploy_launchers.py from the FinSight tools folder to re-create it.
   pause
   exit /b 1
 )
-"%PY%" "%~dp0finsight_launch.py" 
+
+echo [FinSight]  π”√Ω‚ Õ∆˜: %PY%
+"%PY%" "%~dp0finsight_launch.py"
 if errorlevel 1 pause
 endlocal
