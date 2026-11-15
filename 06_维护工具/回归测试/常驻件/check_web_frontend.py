@@ -1,10 +1,12 @@
 """把页面内联 JS 抽出来交给 node --check 做语法校验，并冒烟几个只读接口。"""
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
 
-NODE = r"C:\Users\35999\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
+# 跨平台找 node：优先 PATH，其次开发机专用运行时目录（Linux 服务器上没有后者，找不到时下方会跳过语法检查）
+NODE = shutil.which("node") or r"C:\Users\35999\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
 BASE = "http://127.0.0.1:8501"
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -36,8 +38,13 @@ inline = [body for body in scripts if body.strip()]
 print(f"内联脚本 {len(inline)} 段，共 {sum(len(b) for b in inline)} 字符")
 
 failed = 0
+if not shutil.which(NODE) and not __import__("os").path.exists(NODE):
+    print("WARN 未找到 node，跳过内联 JS 语法检查")
+    inline = []
 for index, body in enumerate(inline):
-    path = rf"%TEMP%\finsight_inline_{index}.js".replace("%TEMP%", __import__("os").environ["TEMP"])
+    import tempfile
+
+    path = __import__("os").path.join(tempfile.gettempdir(), f"finsight_inline_{index}.js")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(body)
     result = subprocess.run([NODE, "--check", path], capture_output=True, text=True, errors="replace")

@@ -3600,10 +3600,14 @@ def retrieve_rag_chunks(
                 missing = [
                     chunk
                     for chunk in workset
-                    if not str(chunk.get("embedding_json") or "").strip()
+                    if not chunk.get("embedding_present")
+                    and not str(chunk.get("embedding_json") or "").strip()
                 ]
                 if missing:
                     index_new_rag_chunks(missing[:500])
+                hydrate = globals().get("hydrate_embeddings")
+                if hydrate:
+                    hydrate([c for c in workset if c.get("embedding_present")])
                 for chunk in workset:
                     try:
                         vector = np.asarray(

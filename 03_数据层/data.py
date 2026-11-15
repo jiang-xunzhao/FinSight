@@ -2956,6 +2956,48 @@ def _save_chat_sessions_unlocked() -> None:
     except Exception:
         pass
 
+def hydrate_embeddings(chunks: list[dict[str, Any]]) -> None:
+    """把内存里减负掉的 embedding_json 按批从 MySQL 补回来。
+
+    低内存部署（2G 机）时 load_rag_chunks 不再把每条一万多字符的向量
+    长文常驻内存，只留 embedding_present 布尔；需要真向量的调用方
+    （同步 Qdrant、本地余弦兜底、向量回写）先调本函数按需补水。
+    """
+    targets = [
+        chunk
+        for chunk in chunks
+        if chunk.get("embedding_present")
+        and not str(chunk.get("embedding_json") or "").strip()
+    ]
+    if not targets:
+        return
+    by_id = [int(chunk["id"]) for chunk in targets if chunk.get("id") is not None]
+    values: dict[int, Any] = {}
+    if by_id:
+        try:
+            connection = pymysql.connect(**db_config())
+            try:
+                with connection.cursor() as cursor:
+                    for start in range(0, len(by_id), 500):
+                        batch = by_id[start : start + 500]
+                        placeholders = ",".join(["%s"] * len(batch))
+                        cursor.execute(
+                            "SELECT id, embedding_json FROM 6_rag_chunks "
+                            f"WHERE id IN ({placeholders})",
+                            batch,
+                        )
+                        for row in cursor.fetchall():
+                            values[int(row["id"])] = row["embedding_json"]
+            finally:
+                connection.close()
+        except Exception:
+            pass
+    for chunk in targets:
+        chunk_id = chunk.get("id")
+        if chunk_id is not None and values.get(int(chunk_id)) is not None:
+            chunk["embedding_json"] = str(values[int(chunk_id)] or "")
+
+
 def load_rag_chunks() -> list[dict[str, Any]]:
     """从数据库或 JSON 恢复 RAG 文本块。"""
     try:
@@ -2965,7 +3007,10 @@ def load_rag_chunks() -> list[dict[str, Any]]:
                 cursor.execute(
                     """
                     SELECT id, file_name, file_path, stock_code, company_name,
-                           page_no, chunk_index, content, embedding_json
+                           page_no, chunk_index, content, embedding_json,
+                           (embedding_json IS NOT NULL
+                            AND CHAR_LENGTH(embedding_json) > 0)
+                           AS embedding_present
                     FROM 6_rag_chunks
                     ORDER BY id
                     """
@@ -2973,7 +3018,12 @@ def load_rag_chunks() -> list[dict[str, Any]]:
                 rows = list(cursor.fetchall())
                 if rows:
                     for row in rows:
-                        if str(row.get("embedding_json") or "").strip():
+                        # 低内存减负：向量长文不常驻，只留 presence 布尔；
+                        # 需要真向量时由 hydrate_embeddings 按需补回。
+                        has_vector = bool(row.pop("embedding_present", False))
+                        row["embedding_json"] = ""
+                        if has_vector:
+                            row["embedding_present"] = True
                             row.setdefault("embedding_model", LOCAL_EMBEDDING_MODEL)
                             row.setdefault("embedding_dim", LOCAL_EMBEDDING_DIM)
                             row.setdefault("embedding_version", VECTOR_INDEX_VERSION)
@@ -2986,7 +3036,14 @@ def load_rag_chunks() -> list[dict[str, Any]]:
         return []
     try:
         payload = json.loads(RAG_CHUNKS_PATH.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, list) else []
+        if isinstance(payload, list):
+            for row in payload:
+                if isinstance(row, dict) and str(
+                    row.get("embedding_json") or ""
+                ).strip():
+                    row["embedding_present"] = True
+            return payload
+        return []
     except Exception:
         return []
 
@@ -3037,13 +3094,17 @@ def load_vector_index_status() -> dict[str, Any]:
     indexed = sum(
         1
         for chunk in RAG_CHUNKS
-        if str(chunk.get("embedding_json") or "").strip()
+        if chunk.get("embedding_present")
+        or str(chunk.get("embedding_json") or "").strip()
     )
     current_model = sum(
         1
         for chunk in RAG_CHUNKS
         if str(chunk.get("embedding_model") or "") == LOCAL_EMBEDDING_MODEL
-        and str(chunk.get("embedding_json") or "").strip()
+        and (
+            chunk.get("embedding_present")
+            or str(chunk.get("embedding_json") or "").strip()
+        )
     )
     return {
         "model": LOCAL_EMBEDDING_MODEL,
@@ -3113,7 +3174,10 @@ def build_rag_vector_index(
             for chunk in RAG_CHUNKS
             if force
             or str(chunk.get("embedding_model") or "") != LOCAL_EMBEDDING_MODEL
-            or not str(chunk.get("embedding_json") or "").strip()
+            or (
+                not chunk.get("embedding_present")
+                and not str(chunk.get("embedding_json") or "").strip()
+            )
         ]
         total_pending = len(pending)
         completed = 0
@@ -3193,7 +3257,9 @@ def sync_qdrant_vector_index(
         chunk
         for chunk in RAG_CHUNKS
         if str(chunk.get("embedding_json") or "").strip()
+        or chunk.get("embedding_present")
     ]
+    hydrate_embeddings(chunks)
     written = vector_store.upsert_chunks(chunks)
     return {
         "written": written,
