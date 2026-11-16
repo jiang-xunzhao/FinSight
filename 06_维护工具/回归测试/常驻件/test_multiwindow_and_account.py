@@ -101,7 +101,7 @@ got = json.loads(b).get("display_name", "") if s == 200 else ""
 check("profile 超长昵称截到 30", s == 200 and got == "超" * 30, f"{s} {got!r}")
 call("POST", "/api/profile", {"display_name": ""}, headers=TEST_HEADERS)  # 清回默认
 
-s, _, b = call("POST", "/api/password", {"old_password": "绝密的错误口令", "new_password": "081066"},
+s, _, b = call("POST", "/api/password", {"old_password": "绝密的错误口令", "new_password": "_t_wrong_pass"},
                headers=TEST_HEADERS)
 check("password 错旧密码 401（非 ASCII 不炸 500）", s == 401, f"{s} {b[:80]}")
 
