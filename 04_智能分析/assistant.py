@@ -2143,7 +2143,7 @@ def canonical_report_period_from_question(question: str) -> str:
     if not year_match:
         return ""
     year = year_match.group(1)
-    if any(word in compact for word in ("半年报", "半年度", "中期")):
+    if any(word in compact for word in ("半年报", "半年度", "中期", "中报")):
         return f"{year}年半年报"
     if any(word in compact for word in ("年报", "年度报告")):
         return f"{year}年年报"
@@ -2151,6 +2151,11 @@ def canonical_report_period_from_question(question: str) -> str:
 
 PERIOD_LITERAL_RE = re.compile(
     r"((?:[A-Za-z_][A-Za-z0-9_]*\.)?report_period)\s*(?:=|LIKE)\s*'([^']*)'",
+    flags=re.I,
+)
+
+PERIOD_IN_RE = re.compile(
+    r"((?:[A-Za-z_][A-Za-z0-9_]*\.)?report_period)\s+IN\s*\(([^()]*)\)",
     flags=re.I,
 )
 
@@ -2165,7 +2170,7 @@ def canonical_period_from_literal(raw: str) -> str:
     if not year_match:
         return ""
     year = year_match.group(1)
-    if re.search(r"半年报|半年度|中期|H1|Q2", text, flags=re.I):
+    if re.search(r"半年报|半年度|中期|中报|H1|Q2", text, flags=re.I):
         return f"{year}年半年报"
     if re.search(r"年报|年度报告|全年|H2|Q4", text, flags=re.I):
         return f"{year}年年报"
@@ -2187,21 +2192,44 @@ def normalize_period_literals(sql: str, question: str = "") -> str:
     模型 5 次写出 `2026-06-30` / `LIKE '2026-06%'` / `LIKE '2026%06%'`，
     全部要靠 attempts=2 的事后纠错才救回来；纠错不成立时就退化成「未查询到匹配数据」，
     表现为**同一题一次有一次没有**的 flaky。归一放在执行前，一次命中。
+
+    实测（2026-11-17，新机 yoy_probe2）：「和去年同期比」的问法模型会改写成
+    `report_period IN ('2026-06-30','2025-06-30')` 双期清单，上面等号/LIKE 的正则
+    罩不住 ⇒ 本函数把 IN 清单逐条归一并去重（全同则收成等号）。
     """
     statement = str(sql or "")
     if "report_period" not in statement.lower():
         return statement
     fallback = canonical_report_period_from_question(question)
 
-    def _replace(match: re.Match[str]) -> str:
-        column, raw = match.group(1), match.group(2)
+    def _canonical_one(raw: str) -> str:
         canonical = canonical_period_from_literal(raw)
         if not canonical and re.search(r"[-/.]\d{1,2}|%\d{1,2}%|\d{8}", raw):
             canonical = fallback
+        return canonical or ""
+
+    def _replace(match: re.Match[str]) -> str:
+        column, raw = match.group(1), match.group(2)
+        canonical = _canonical_one(raw)
         if not canonical or canonical == raw:
             return match.group(0)
         return f"{column}='{canonical}'"
 
+    def _replace_in(match: re.Match[str]) -> str:
+        column, body = match.group(1), match.group(2)
+        items = re.findall(r"'([^']*)'", body)
+        if not items:
+            return match.group(0)
+        values: list[str] = []
+        for raw in items:
+            value = _canonical_one(raw) or raw
+            if value not in values:
+                values.append(value)
+        if len(values) == 1:
+            return f"{column}='{values[0]}'"
+        return f"{column} IN ({', '.join(chr(39) + v + chr(39) for v in values)})"
+
+    statement = PERIOD_IN_RE.sub(_replace_in, statement)
     return PERIOD_LITERAL_RE.sub(_replace, statement)
 
 def make_client(api_key: str, base_url: str) -> OpenAI:
