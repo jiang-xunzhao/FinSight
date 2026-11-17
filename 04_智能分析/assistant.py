@@ -5842,6 +5842,30 @@ def handle_chat_request(request: dict[str, Any]) -> dict[str, Any]:
     result["evidence_summary"] = build_evidence_summary(
         result.get("evidence") or []
     )
+    # 执行日志补真：快速直查路径（锁定公司直答/任务直答/统计概览/本地模式）
+    # 不走规划器，一条 subtask_done 都不落，右侧「执行日志」就永远显示
+    # 成功0·无数据0·失败0——明明答对了却像没干活。这里补记一条真实执行事件，
+    # 状态、行数、出处数、耗时都取自已定型的 result，不掺假。
+    _log_events = request.get("_log_events")
+    if isinstance(_log_events, list) and not any(
+        isinstance(item, dict) and item.get("type") == "subtask_done"
+        for item in _log_events
+    ):
+        task_log(
+            request,
+            {
+                "type": "subtask_done",
+                "subtask_id": "direct",
+                "kind": "direct",
+                "company": str(result.get("company_name") or ""),
+                "status": "empty" if str(result.get("mode") or "") == "guide" else "completed",
+                "rows": len(result.get("table") or []),
+                "sources": len(result.get("evidence") or []),
+                "attempts": 1,
+                "duration": round(time.perf_counter() - thinking_started, 2),
+                "purpose": "本地直查（未走任务规划）",
+            },
+        )
     result["execution_logs"] = list(request.get("_log_events") or [])
     result["sources"] = []
     # 先写思考时长再落会话：历史里重开这条回答也带着它

@@ -3857,9 +3857,32 @@ html.theme-lite{
       will-change: auto !important; text-shadow: none !important;
     }
     html.theme-lite .brand-logo { filter: none !important; -webkit-filter: none !important; }
+
+    /* —— 系统准备中：数据到齐前的静态遮罩（无动效） —— */
+    #bootMask {
+      position: fixed; inset: 0; z-index: 2147483000;
+      display: flex; align-items: center; justify-content: center;
+      background: linear-gradient(rgba(3, 7, 15, 0.55), rgba(3, 7, 15, 0.55)),
+        url("/assets/bg-tech.jpg") center / cover no-repeat, #03070f;
+    }
+    #bootMask .boot-tip {
+      font-size: 14px; letter-spacing: 0.3em; padding: 10px 18px 10px 21px;
+      border-radius: 999px; color: #cfe3f5;
+      background: rgba(3, 7, 15, 0.45); border: 1px solid rgba(120, 200, 255, 0.18);
+    }
+    html.theme-lite #bootMask {
+      background: linear-gradient(rgba(248, 251, 255, 0.55), rgba(248, 251, 255, 0.55)),
+        url("/assets/bg-finsight.png") center / cover no-repeat, #f8fbff;
+    }
+    html.theme-lite #bootMask .boot-tip {
+      color: #16202e; background: rgba(255, 255, 255, 0.78);
+      border: 1px solid rgba(22, 32, 46, 0.10);
+    }
+    #bootMask[hidden] { display: none; }
 </style>
 </head>
 <body class="page-chat">
+<div id="bootMask" aria-hidden="true"><div class="boot-tip">系统准备中</div></div>
 <div class="bg" aria-hidden="true"></div>
 <div class="fx-bg" aria-hidden="true"></div>
 <script src="/assets/chart.umd.min.js?v=20260914"></script>
@@ -4355,6 +4378,12 @@ async function readJson(response, label) {
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error((payload && payload.detail) || `${label || "请求"}失败（HTTP ${response.status}）`);
+  }
+  if (payload && typeof payload === "object" && !Array.isArray(payload)
+    && Object.prototype.hasOwnProperty.call(payload, "detail")) {
+    // 状态码好看但带 detail 的软失败（历史踩过）：不能当成功数据用，
+    // 否则「系统准备中」会被假成功提前揭幕。
+    throw new Error(String(payload.detail || `${label || "请求"}失败`));
   }
   return payload;
 }
@@ -7271,9 +7300,23 @@ async function bootstrapAccount() {
 }
 bootstrapAccount();
 loadRecommendations().then(pickSuggestions);
-loadSummary();
-loadHistory();
-loadDocuments();
+// 系统准备中：概览/历史/文件三件事全部落定（成败都算落定）再揭幕；
+// 最短站住 400ms 防一闪而过，最长 12 秒强制放行（后端挂了也要让人进界面）。
+(function bootMaskCtl() {
+  const mask = document.getElementById("bootMask");
+  if (!mask) return;
+  const started = Date.now();
+  let settled = false, removed = false;
+  const reveal = () => {
+    if (removed) return;
+    removed = true;
+    const wait = Math.max(0, 400 - (Date.now() - started));
+    setTimeout(() => { mask.hidden = true; mask.remove(); }, wait);
+  };
+  Promise.allSettled([loadSummary(), loadHistory(), loadDocuments()])
+    .then(() => { settled = true; reveal(); });
+  setTimeout(() => { if (!settled) reveal(); }, 12000);
+})();
 document.getElementById("fileSearchBtn").onclick = loadDocuments;
 document.getElementById("fileSearch").addEventListener("keydown", event => {
   if (event.key === "Enter") {
