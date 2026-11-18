@@ -4510,21 +4510,93 @@ def answer_with_llm(question: str, request: dict[str, Any]) -> dict[str, Any]:
     client = make_client(request.get("api_key", ""), request.get("base_url", ""))
     task_stage(request, "生成回答")
     task_wait(request)
+    completion_messages = [
+        {
+            "role": "system",
+            "content": system_content,
+        },
+        {
+            "role": "user",
+            "content": user_content,
+        },
+    ]
     response = client.chat.completions.create(
         model=request.get("llm_model", DEEPSEEK_MODEL),
-        messages=[
-            {
-                "role": "system",
-                "content": system_content,
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
-        ],
+        messages=completion_messages,
         temperature=0.1,
     )
     answer = response.choices[0].message.content or ""
+    # —— 回答质检门（执行→验证→修正循环）——
+    # 初稿出来后先过一道程序化检查：空答案 / 混入本会话范围外的公司 ⇒
+    # 打回给撰写智能体重写，最多重做一次；二稿仍有问题就保留二稿，
+    # 交给后续 enforce_company_scope 兜底剥离——不能无限循环白烧调用。
+    gate_events: list[dict[str, Any]] = []
+
+    def _gate_problems(text: str) -> list[str]:
+        issues: list[str] = []
+        if len((text or "").strip()) < 8:
+            issues.append("回答为空或过短，没有给出有效结论")
+        if locked.get("ticker"):
+            foreign = foreign_entities_in_answer(text, locked, user_content)
+            if foreign:
+                issues.append(
+                    "出现了本会话范围外的公司内容：" + "、".join(foreign[:3])
+                )
+        return issues
+
+    gate_problems = _gate_problems(answer)
+    if not gate_problems:
+        gate_events.append(
+            {"stage": "answer_gate", "status": "passed", "action": "初稿通过质检复检"}
+        )
+        task_log(request, {"type": "answer_gate", "status": "passed"})
+    else:
+        gate_events.append(
+            {
+                "stage": "answer_gate",
+                "status": "rejected",
+                "action": "质检打回，交回撰写智能体重做",
+                "problems": gate_problems,
+            }
+        )
+        task_log(
+            request,
+            {"type": "answer_gate", "status": "rejected", "problems": gate_problems},
+        )
+        response = client.chat.completions.create(
+            model=request.get("llm_model", DEEPSEEK_MODEL),
+            messages=completion_messages
+            + [
+                {"role": "assistant", "content": answer},
+                {
+                    "role": "user",
+                    "content": "【质检打回】上一稿存在以下问题："
+                    + "；".join(gate_problems)
+                    + "。请严格依据上面提供的结构化数据与财报原文重写：只写本会话范围内的公司，第一句直接给结论；不要解释修改过程。",
+                },
+            ],
+            temperature=0.1,
+        )
+        regen = (response.choices[0].message.content or "").strip()
+        if regen:
+            answer = regen
+        still = _gate_problems(answer)
+        gate_events.append(
+            {
+                "stage": "answer_gate",
+                "status": "regen_done" if not still else "regen_partial",
+                "action": "重写后复检通过" if not still else "重写一次后仍有问题，转兜底过滤",
+                "problems": still,
+            }
+        )
+        task_log(
+            request,
+            {
+                "type": "answer_gate",
+                "status": "regen_done" if not still else "regen_partial",
+                "problems": still,
+            },
+        )
     task_stage(request, "整理回答")
     task_wait(request)
     stock_code = (
@@ -4623,7 +4695,8 @@ def answer_with_llm(question: str, request: dict[str, Any]) -> dict[str, Any]:
             trace
             for item in (execution or {}).get("results") or []
             for trace in item.get("correction_log") or []
-        ],
+        ]
+        + gate_events,
         "warnings": plan_warnings,
     }
 

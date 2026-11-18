@@ -3896,6 +3896,7 @@ html.theme-lite{
       <button class="nav-btn" data-page="files">文件库</button>
       <button class="nav-btn" data-page="validation">数据校验</button>
       <button class="nav-btn" data-page="coverage">数据体检</button>
+      <button class="nav-btn" data-page="basis">数据依据</button>
       <button class="nav-btn" data-page="import">数据导入</button>
     </nav>
 
@@ -4126,6 +4127,16 @@ html.theme-lite{
         <div id="coverageList"></div>
       </div>
     </section>
+
+    <section class="page" id="page-basis">
+      <div class="page-panel">
+        <h2>数据依据</h2>
+        <p class="muted-note">回答里的每个数字都出自下面的家底：已入库的财报原文 PDF、切好的原文段落、勾稽核对记录。本页数字实时盘点，和查询用的是同一份库。</p>
+        <div class="ov-strip" id="basisStats"><span class="muted">正在盘点…</span></div>
+        <div id="basisList"></div>
+        <p class="muted-note">回答生成后自带出处卡片，点「打开原文 · 第N页」可直接跳到 PDF 对应页核数。</p>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -4208,6 +4219,7 @@ const pageTitles = {
   files: "文件库",
   validation: "数据校验",
   coverage: "数据体检",
+  basis: "数据依据",
   import: "数据导入",
   account: "账户设置"
 };
@@ -4232,6 +4244,7 @@ function switchPage(pageName) {
   if (pageName === "files") loadDocuments();
   if (pageName === "validation") loadValidation();
   if (pageName === "coverage") loadCoverage();
+  if (pageName === "basis") loadBasis();
 }
 
 document.querySelectorAll(".nav-btn").forEach(button => {
@@ -4717,6 +4730,54 @@ async function loadCoverage() {
 }
 
 document.getElementById("refreshCoverage").onclick = loadCoverage;
+
+async function loadBasis() {
+  const stats = document.getElementById("basisStats");
+  const list = document.getElementById("basisList");
+  if (!stats || !list) return;
+  stats.innerHTML = '<span class="muted">正在盘点…</span>';
+  let summary, coverage, vector, validation;
+  try {
+    [summary, coverage, vector, validation] = await Promise.all([
+      fetch("/api/summary").then(response => readJson(response, "概览指标")),
+      fetch("/api/coverage").then(response => readJson(response, "数据体检")),
+      fetch("/api/vector-index").then(response => readJson(response, "向量索引状态")),
+      fetch("/api/validation").then(response => readJson(response, "校验结果"))
+    ]);
+  } catch (error) {
+    stats.innerHTML = `<span class="muted">${escapeHtml(error.message)}</span>`;
+    list.innerHTML = "";
+    return;
+  }
+  const count = key => Number((summary || {})[key] || 0).toLocaleString("zh-CN");
+  const checkRows = Array.isArray(validation) ? validation : [];
+  const passed = checkRows.filter(item => item["结果"] === "通过").length;
+  const failed = checkRows.filter(item => item["结果"] === "异常").length;
+  const pending = checkRows.length - passed - failed;
+  const fact = (value, unit, label) =>
+    `<span class="ov-fact"><b>${value}</b><em>${unit}</em><i>${label}</i></span>`;
+  stats.innerHTML = [
+    fact(count("companies"), "家", "已入库公司"),
+    fact(count("documents"), "份", "财报原文 PDF"),
+    fact(count("rag_chunks"), "段", "可检索原文段落"),
+    fact(count("performance"), "条", "业绩与财务记录"),
+    fact(String(passed), "项通过", checkRows.length ? `勾稽核对（异常 ${failed} · 待补充 ${pending}）` : "勾稽核对"),
+    fact(Number((vector || {}).total || 0).toLocaleString("zh-CN"), (vector || {}).ready ? "点 · 已就绪" : "点 · 构建中", "向量索引"),
+  ].join('<span class="ov-sep"></span>');
+  const rows = Array.isArray((coverage || {}).rows) ? coverage.rows : [];
+  list.innerHTML = rows.map(row => {
+    const flags = row.flags || [];
+    const detail = `原文 ${Number(row.document_count || 0)} 份 · 报告期 ${(row.periods || []).join("、") || "无"}`;
+    const verdict = flags.length
+      ? flags.map(item =>
+          `<span class="cov-flag${item.level === "bad" ? " bad" : ""}">${escapeHtml(item.text)}</span>`
+        ).join(" · ")
+      : '<span class="cov-ok">依据完整</span>';
+    return `<div class="cov-row"><b>${escapeHtml(row.company_name || "")}</b>` +
+      `<span class="cov-code">${escapeHtml(row.stock_code || "")}</span>` +
+      `<span class="muted">${escapeHtml(detail)}</span>${verdict}</div>`;
+  }).join("") || '<p class="muted">库里还没有公司数据。</p>';
+}
 
 async function loadValidation() {
   const summary = document.getElementById("validationSummary");
@@ -6621,6 +6682,19 @@ function renderSqlLogs(logs, status = "") {
       const companies = (item.companies || []).filter(Boolean).join("、");
       return `<div class="sql-log-item success"><strong>规划完成</strong> ${Number(item.subtasks || 0)} 个子任务${companies ? ` · ${escapeHtml(companies)}` : ""}<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
     }
+    if (item.type === "answer_gate") {
+      if (item.status === "passed") {
+        return `<div class="sql-log-item success"><strong>答案质检</strong> 初稿通过复检：无越界内容、结论完整<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
+      }
+      if (item.status === "rejected") {
+        return `<div class="sql-log-item failed"><strong>质检打回</strong> ${escapeHtml((item.problems || []).join("；"))}<div class="sql-log-meta">已交回撰写智能体重做 · ${escapeHtml(item.time || "")}</div></div>`;
+      }
+      if (item.status === "regen_done" || item.status === "regen_partial") {
+        const ok = item.status === "regen_done";
+        return `<div class="sql-log-item ${ok ? "success" : "empty"}"><strong>重写复检</strong> ${ok ? "重写后通过质检" : "重写后仍有问题，转兜底过滤"}<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
+      }
+      return "";
+    }
     if (item.type === "subtask_start") {
       return `<div class="sql-log-item running"><strong>开始${item.kind === "rag" ? "资料检索" : "SQL查询"}</strong> ${escapeHtml(item.company || "")}<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
     }
@@ -6664,6 +6738,16 @@ if (sqlLogCopyButton) {
         lines.push(`-- 阶段：${item.stage || ""}  ${item.time || ""}`);
       } else if (item.type === "plan") {
         lines.push(`-- 规划完成：${Number(item.subtasks || 0)} 个子任务`);
+      } else if (item.type === "answer_gate") {
+      const label =
+        item.status === "passed"
+          ? "初稿通过复检"
+          : item.status === "rejected"
+          ? "质检打回：" + (item.problems || []).join("；")
+          : item.status === "regen_done"
+          ? "重写后通过"
+          : "重写后仍有问题，转兜底过滤";
+      lines.push(`-- 答案质检：${label}`);
       } else if (item.type === "subtask_start") {
         lines.push(`-- 开始${item.kind === "rag" ? "资料检索" : "SQL查询"}：${item.company || ""}`);
       } else if (item.type === "subtask_done") {
