@@ -85,6 +85,49 @@ AVATAR_MAGIC = (
     (b"GIF89a", "image/gif"),
 )
 
+# 文件删除是重活（事实表整期删+剩余文件重灌+向量点清理，分钟级），
+# 原来同步压在 HTTP 请求线程里做：慢机上一删就假死、前端超时后用户以为没删
+# 又点一次，半途而废留脏数据（2026-11-19 云南白药案就是这么来的）。
+# 改成后台任务表：点删除=登记任务立即返回，前端轮询进度，同一时刻只允许一个在跑。
+DELETE_JOBS: dict[str, dict] = {}
+DELETE_JOBS_LOCK = threading.Lock()
+
+def delete_job_snapshot() -> list[dict]:
+    with DELETE_JOBS_LOCK:
+        return [dict(job, jobId=key) for key, job in DELETE_JOBS.items()]
+
+def _run_delete_job(job_id: str, document_id: str) -> None:
+    try:
+        outcome = delete_document(document_id)
+        with DELETE_JOBS_LOCK:
+            DELETE_JOBS[job_id].update(status="done", result=outcome)
+    except Exception as exc:
+        with DELETE_JOBS_LOCK:
+            DELETE_JOBS[job_id].update(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:200]}")
+    finally:
+        # 只留最近 8 条，防止长跑服务攒垃圾
+        with DELETE_JOBS_LOCK:
+            finished = [k for k, v in DELETE_JOBS.items() if v.get("status") != "running"]
+            for old_key in finished[:-8]:
+                DELETE_JOBS.pop(old_key, None)
+
+def start_delete_job(document_id: str) -> dict:
+    """返回任务登记结果 dict。已有任务在跑时不重复登记——重删正是脏数据的源头。"""
+    with DELETE_JOBS_LOCK:
+        for job in DELETE_JOBS.values():
+            if job.get("status") == "running":
+                return {"ok": False, "busy": True, "jobId": job["jobId"],
+                        "detail": "已有删除任务正在进行，请等它完成"}
+        job_id = str(int(time.time() * 1000))
+        DELETE_JOBS[job_id] = {
+            "jobId": job_id, "status": "running", "id": document_id,
+            "detail": "后台删除中（含同报告期剩余文件的重灌）",
+        }
+    threading.Thread(
+        target=_run_delete_job, args=(job_id, document_id), daemon=True
+    ).start()
+    return {"ok": True, "jobId": job_id, "status": "running", "detail": "删除任务已开始"}
+
 def auth_enabled() -> bool:
     """登录闸门总开关：.env 同时有 LOGIN_USER+LOGIN_PASSWORD 才启用；
     FINSIGHT_DISABLE_LOGIN=1 是紧急总闸（测试/本机排障用），置 1 直接不启用。"""
@@ -1064,6 +1107,9 @@ class Handler(BaseHTTPRequestHandler):
                             evidence
                         )
                 self.send_json(detail)
+            elif path == "/api/documents/delete-progress":
+                # 给文件库轮询用：返回最近若干删除任务的终态/进行中状态
+                self.send_json({"jobs": delete_job_snapshot()})
             elif path.startswith("/api/import/status/"):
                 job_id = path.rsplit("/", 1)[1]
                 with IMPORT_JOBS_LOCK:
@@ -1102,7 +1148,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(delete_all_documents())
         elif path.startswith("/api/documents/"):
             try:
-                self.send_json(delete_document(path.rsplit("/", 1)[1]))
+                # v-2.5：删除改后台任务（见 DELETE_JOBS 注释）。立即回 job 号，
+                # 前端轮询 /api/documents/delete-progress；真删完再把列表刷回来。
+                outcome = start_delete_job(path.rsplit("/", 1)[1])
+                self.send_json(outcome, 409 if outcome.get("busy") else 200)
             except KeyError as exc:
                 self.send_json({"detail": str(exc)}, 404)
         else:
@@ -2276,7 +2325,7 @@ window.__THEME_PREF=t;window.__TL=lite;if(lite)document.documentElement.classLis
     }
     .answer-summary {
       margin: 0 0 16px; font-size: 15.5px; line-height: 1.72; color: var(--pure);
-      letter-spacing: -.014em; font-weight: 450;
+      letter-spacing: -.014em; font-weight: 450; white-space: pre-wrap;
     }
     /* 结论句里的关键数字提亮 */
     .answer-summary .num-hl { color: var(--accent); font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -3598,7 +3647,7 @@ html.theme-lite{
 
     html.theme-lite .answer-summary{
       margin: 0 0 16px; font-size: 15.5px; line-height: 1.72; color: var(--pure);
-      letter-spacing: -.014em; font-weight: 450;
+      letter-spacing: -.014em; font-weight: 450; white-space: pre-wrap;
     }
 
     /* 结论句里的关键数字提亮 */html.theme-lite .answer-summary .num-hl{ color: #2a5178; font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -4668,16 +4717,42 @@ async function loadDocuments() {
         window.open(`/api/documents/open/${documentItem.id}`, "_blank");
       };
       row.querySelector(".file-delete").onclick = async () => {
+        const button = row.querySelector(".file-delete");
+        let payload;
         try {
-          await readJson(await fetch(`/api/documents/${documentItem.id}`, { method: "DELETE" }), "删除文件");
+          payload = await readJson(await fetch(`/api/documents/${documentItem.id}`, { method: "DELETE" }), "删除文件");
         } catch (error) {
           // 删除失败要说出来：原来直接刷列表，文件还在，看上去像界面抽风
           list.innerHTML = `<div class="muted">${escapeHtml(error.message)}</div>`;
           return;
         }
-        loadDocuments();
-        loadSummary();
-        loadRecommendations().then(pickSuggestions);
+        // 后台任务模式：按钮变成进度提示，轮询到 done/failed 才刷列表——
+        // 用户看得见"还在删"，不会再手痒点第二下造成半途而废
+        button.textContent = "删除中…";
+        button.disabled = true;
+        const deadline = Date.now() + 10 * 60 * 1000;
+        const timer = setInterval(async () => {
+          try {
+            const snap = await readJson(await fetch("/api/documents/delete-progress"), "删除进度");
+            const job = (snap.jobs || []).find(item => item.jobId === payload.jobId);
+            if (job && job.status === "failed") {
+              clearInterval(timer);
+              list.innerHTML = `<div class="muted">删除失败：${escapeHtml(job.detail || "未知原因")}</div>`;
+              return;
+            }
+            if (job && job.status === "done") { clearInterval(timer); refresh(); return; }
+            if (Date.now() > deadline) {
+              clearInterval(timer);
+              list.innerHTML = '<div class="muted">删除任务仍在后台进行，稍后手动刷新查看结果</div>';
+            }
+          } catch (error) { /* 瞬时取不到状态不打断轮询 */ }
+        }, 1500);
+        const refresh = () => {
+          loadDocuments();
+          loadSummary();
+          loadRecommendations().then(pickSuggestions);
+        };
+        if (payload.status !== "running" && payload.jobId === undefined) refresh();
       };
       wrapper.appendChild(row);
     });
@@ -6695,6 +6770,15 @@ function renderSqlLogs(logs, status = "") {
       }
       return "";
     }
+    if (item.type === "evidence_gate") {
+      if (item.status === "blocked") {
+        return `<div class="sql-log-item failed"><strong>证据闸门</strong> 问题关键词在证据中没有依据，已按「未检索到」作答<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
+      }
+      if (item.status === "weak") {
+        return `<div class="sql-log-item empty"><strong>证据贴合提醒</strong> 问题与证据重合较少，已要求严格贴证据作答<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
+      }
+      return "";
+    }
     if (item.type === "subtask_start") {
       return `<div class="sql-log-item running"><strong>开始${item.kind === "rag" ? "资料检索" : "SQL查询"}</strong> ${escapeHtml(item.company || "")}<div class="sql-log-meta">${escapeHtml(item.time || "")}</div></div>`;
     }
@@ -7255,8 +7339,9 @@ function paintAccountBar() {
 }
 
 accountCard.onclick = () => switchPage("account");
-// 深链：#account 直达账户设置页（无侧栏钮的账户页给截图验收与收藏用）
-if (location.hash === "#account") switchPage("account");
+// 深链：#页面名 直达对应功能页（无侧栏钮的页给截图验收与收藏用）
+const _hashPage = (location.hash || "").slice(1);
+if (["chat", "files", "validation", "coverage", "basis", "import", "account"].includes(_hashPage)) switchPage(_hashPage);
 document.getElementById("accountGear").onclick = event => {
   event.stopPropagation();
   switchPage("account");
